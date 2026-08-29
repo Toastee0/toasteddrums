@@ -1,0 +1,18 @@
+[package]
+name = "toasteddrums"
+version = "0.1.0"
+edition = "2021"
+description = "ToastedDrums: a toy-keyboard drum machine for the laptop, visualized on the desk annunciator (panels 1/2). Zero crates, house style."
+
+[[bin]]
+name = "toasteddrums"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
