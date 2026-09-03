@@ -93,11 +93,16 @@ struct Cfg {
 // a fraction of the wall plates' rate, so any single slope gate silenced them. The trigger
 // is now one thing: did the signal bounce past thresh counts below the baseline.
 struct PadDefault { float thresh, slope, gain; };
+// gain is deliberately ~1.6x the measured typical drop, NOT equal to it. Setting gain to
+// the typical drop means every ordinary hit computes vel = depth/gain*127 = 127, so the
+// whole kit plays at maximum and there is no dynamic range at all -- observed as "all floor
+// hits come in at vel 127". With headroom a normal strike lands near 80 and only a hard one
+// reaches the top.
 static const PadDefault PAD_DEFAULTS[N] = {
-  {  35.0f,  8.0f,  50.0f },   // P2  floor
-  {  35.0f,  8.0f,  48.0f },   // P4  floor
-  { 150.0f, 35.0f, 300.0f },   // P33 wall
-  { 150.0f, 35.0f, 300.0f },   // P32 wall
+  {  35.0f,  8.0f,  80.0f },   // P2  floor, typical drop  50
+  {  35.0f,  8.0f,  78.0f },   // P4  floor, typical drop  48
+  { 150.0f, 35.0f, 480.0f },   // P33 wall,  typical drop 300
+  { 150.0f, 35.0f, 480.0f },   // P32 wall,  typical drop 300
 };
 
 static void cfgDefaults() {
@@ -658,7 +663,16 @@ void loop() {
         break;
       }
       case LOCKED: {
-        if (now - p.t_onset >= cfg.lockout_ms) {
+        // Re-arm only once the signal has come back UP past the release level, not merely
+        // when the lockout timer expires. The baseline is static, so a foot resting on the
+        // pad holds the reading below thresh indefinitely -- without this the detector
+        // refires the instant lockout ends, every hold+lockout ms. Heard as a machine-gun
+        // stutter while a pad is held down.
+        //
+        // Releasing at half the trigger threshold is ordinary hysteresis: far enough below
+        // the trigger that a real strike's decay clears it, far enough above zero that
+        // resting noise cannot rattle the pad back and forth across the boundary.
+        if (now - p.t_onset >= cfg.lockout_ms && defl < thresh * 0.5f) {
           p.st = IDLE; p.prev_v = v; p.prev_t = now;
         }
         break;
