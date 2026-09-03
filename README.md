@@ -1,7 +1,7 @@
 # ToastedDrums
 
-A toy-keyboard drum machine for the laptop (ADRIAN-LT) that visualizes on the desk
-annunciator (XIAO RP2040 + 43-px chain, panels 1/2 = the free 3×3s). Rust, zero crates.
+A toy-keyboard drum machine that visualizes on the desk annunciator (XIAO RP2040 + 43-px
+chain, panels 1/2 = the free 3×3s), played from four capacitive steel pads. Rust, zero crates.
 
 Samples: [analogcode/toykeyboards](https://github.com/analogcode/toykeyboards)
 (royalty-free hits from Yamaha PSS/PSR + Casio MT-52/MT-240) — cloned into `toykeyboards/`
@@ -14,7 +14,7 @@ Samples: [analogcode/toykeyboards](https://github.com/analogcode/toykeyboards)
 - `src/wav.rs` RIFF reader/writer · `src/kit.rs` · `src/seq.rs` sequencer+mixer+glow ·
   `src/vis.rs` 3×3 frame + COBS/CRC16 packet (byte-identical to `annunciator-rs/frame.rs`).
 
-## Bench (runs on coffee0, no hardware)
+## Bench (no hardware)
 ```sh
 cargo test
 cargo build --release
@@ -22,8 +22,67 @@ cargo build --release
 ./target/release/toasteddrums show   kits/mt240.kit kits/basic.pat                   # per-step 3×3 frames
 ```
 
-## Next (laptop build)
-1. `live` command: WASAPI output (kernel FFI, house style) + paint panel 1 over COM9 at step rate.
-2. Port ownership: COM9 is held by `annunciator.exe` — decide whether ToastedDrums is a mode of
+## The pads — `fw/pads32` (built and working on PHOBOS-LT)
+
+Four bare steel plates: two screwed to the wall (hand), two lying on carpet (foot). They
+drive a **classic ESP32 devkit** (ESP32-WROOM-32, CP2102 → COM5) on **GPIO 2, 4, 33, 32**.
+The board is an INPUT DEVICE ONLY — all sound is made by the host.
+
+Build: `arduino-cli compile -b esp32:esp32:esp32 ./fw/pads32` (bare FQBN — see kit doc).
+Watch: `.\kit\watch.ps1` — does the handshake and draws hits, velocities and waveforms.
+
+### Why not the ReSpeaker/XIAO-S3 in `kit/`
+The original plan (`fw/pads`, `kit/`) targeted a Seeed ReSpeaker Lite + XIAO ESP32-S3, for
+its onboard codec. Two things killed it, both recorded in `kit/PHOBOS_KIT.md`:
+1. The carrier only breaks out **two** usable touch pins. GPIO16/17 have no touch hardware
+   at all, and SDA/SCL carry the codec's I²C pull-ups.
+2. The ESP32-S3 NG touch driver **hangs** — `touchBenchmarkThreshold()` burns 3 × 2000 ms
+   `oneshot_scanning` timeouts per channel and never recovers.
+
+Since the host makes the sound, the codec was worth nothing, and the classic ESP32 has ten
+touch channels and no such hang. `kit/` is kept for the S3 history and the trap list.
+
+### Serial protocol (115200 8N1 default, `baud <n>` to go faster)
+The device calibrates for 1 s at boot (median of 256 samples/pad — **do not touch the pads**),
+then sits in **OFFER**, beaconing its normals and streaming nothing until a session exists:
+
+```
+! offer pads32 proto=5 pads=4 P2=145 P4=138 P33=502 P32=476
+hello drumkit     → ok hello ... + the current cfg blob (populate your sliders from this)
+cfg <blob>        → ok cfg applied=N rejected=M
+go                → LIVE
+```
+
+If no host ever speaks it goes LIVE on saved NVS config after 8 s, so a plain terminal
+works. Hits are always queued, so either style works:
+
+```
+h 0 P2 45 12345 22.1 base=145 min=113 slope=5.21     pushed
+poll → ok poll n=2 ms=12456 dropped=0 + h lines + v P2=145,144 ...   pulled
+```
+
+`thresh` / `slope` / `gain` are **per-pad and live** — no reboot — so the drum machine can
+have real sensitivity sliders. Only `dur` needs a restart (`touchSetConfig()` latches before
+the first `touchRead()`). Config persists in NVS via `save`.
+
+### Facts that cost time (full list in `kit/PHOBOS_KIT.md`)
+- Values **fall** when touched on this chip. Hits are 60–70% deflections.
+- Baselines differ hugely by mounting (wall ~500–700, floor on carpet ~140–450), and ambient
+  drift is the same size as a hit — so every threshold is a **percentage of that pad's own
+  tracked baseline**, never an absolute count.
+- A shoe sole is a thick dielectric; a hand on bare metal is nearly direct contact. Foot pads
+  couple far more weakly for equal effort. Hence per-pad tuning.
+- Never use GPIO0 as a pad: it is the BOOT strap, its pull-up clamps it to a flat 0, and the
+  CP2102's DTR line drives it — a terminal asserting DTR drops the chip into
+  "waiting for download". `watch.ps1` deasserts DTR **and** RTS for this reason.
+
+## Next
+1. **Host-side pad driver**: open the port, `hello` / `go`, turn `h` events into voice
+   triggers. This is the missing link — the engine has no serial input path yet.
+2. `live` command: WASAPI output (kernel FFI, house style) + paint panel 1 over COM9 at step rate.
+3. Port ownership: COM9 is held by `annunciator.exe` — decide whether ToastedDrums is a mode of
    annunciator-rs or annunciator.exe exposes a local pipe (see `~/HANDOFF_HISTORY/ANNUNCIATOR_CLIENT_HANDOFF.md`).
-3. Input: keyboard pads / MIDI.
+4. Map 4 pads onto 9 voices (bank/shift?), and decide whether pads play live over the
+   sequencer or record into the pattern.
+5. Velocity curve: `gain` is currently linear. Real kits want a curve, and it belongs on the
+   host where it can be changed without reflashing.
