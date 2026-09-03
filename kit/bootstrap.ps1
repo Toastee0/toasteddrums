@@ -6,7 +6,10 @@ $ErrorActionPreference = "Stop"
 if (-not (Get-Command arduino-cli -ErrorAction SilentlyContinue)) {
   Write-Host "installing arduino-cli..."
   winget install --id ArduinoSA.CLI --accept-source-agreements --accept-package-agreements
-  $env:PATH = "$env:PATH;$env:LOCALAPPDATA\Microsoft\WinGet\Links"
+  # The MSI puts arduino-cli in Program Files and edits the *machine* PATH, which this
+  # already-running shell cannot see — hence the explicit path here. Without it this
+  # script printed an error and still exited 0, installing no core at all.
+  $env:PATH = "$env:PATH;C:\Program Files\Arduino CLI;$env:LOCALAPPDATA\Microsoft\WinGet\Links"
 }
 
 arduino-cli config init --overwrite
@@ -17,5 +20,5 @@ arduino-cli core update-index
 arduino-cli core install esp32:esp32@3.3.11
 
 Write-Host "`nbuild + flash from here with:"
-Write-Host '  arduino-cli compile -b esp32:esp32:XIAO_ESP32S3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi .\pads'
-Write-Host '  arduino-cli upload  -b esp32:esp32:XIAO_ESP32S3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi -p COMn .\pads'
+Write-Host '  arduino-cli compile -b esp32:esp32:XIAO_ESP32S3 .\pads'
+Write-Host '  arduino-cli upload  -b esp32:esp32:XIAO_ESP32S3 -p COMn .\pads'

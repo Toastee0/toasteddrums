@@ -37,10 +37,12 @@ shipped. So the pad→pin map is **not assumed**: the firmware scans every free 
 channel — **GPIO 1, 2, 3, 4, 5, 9** — and prints them all. Touch one plate at a time and the
 channel that moves names that pad's pin. Write the resulting map down here.
 
-Known so far: A1=GPIO2, A2=GPIO3, A3=GPIO4 (TOUCH2-4). If a lead continued down past A3 it
-is on **D4/GPIO5**, which is TOUCH5 and reads fine, but is also the XMOS **I2C SDA** — no
-problem for the silent bench, but move that lead to the free A0/GPIO1 before wiring audio,
-because the codec setup needs that bus.
+**Operator-reported 2026-09-01 ~00:10 (pending on-bench confirmation — firmware does not yet
+stream, see "Bench status" below):** a lead was added at A0, so the four pads are
+**A0=GPIO1, A1=GPIO2, A2=GPIO3, A3=GPIO4 = TOUCH1-4** — exactly the four channels the
+firmware was written for. **A4/GPIO5 is a genuine spare**, but it is the XMOS **I2C SDA**, so
+it is only free while the bench is silent; it must be given back before the codec is set up.
+GPIO9 (D10) is the other free touch pin if a sixth is ever wanted without touching I2C.
 
 The plate is the electrode; the return goes to the board GND. Long leads add baseline capacitance and pick up mains hum — expect the baseline to
 differ per pad and per cable length. That is fine; it is why the firmware tracks a
@@ -108,3 +110,67 @@ Flash, then get numbers before writing any trigger logic:
 Fastest start: `.\flash.ps1` then `.\mon.ps1`. Run `bootstrap.ps1` in another window
 meanwhile — after it finishes, phobos can build the firmware itself and coffee0 is only
 needed for the host-side Rust.
+
+## Bench status — phobos session 1, 2026-09-01 ~00:40
+Session 1 is **not** done: no pad characterization yet. What is settled:
+
+**phobos was a bare laptop.** Needed `uv` (winget `astral-sh.uv`) before `flash.ps1` could
+get esptool. `bootstrap.ps1` had two bugs, both now fixed here:
+1. It added only `WinGet\Links` to PATH, but the arduino-cli MSI installs to
+   `C:\Program Files\Arduino CLI`. `$ErrorActionPreference="Stop"` does not trap a native
+   command-not-found, so it printed an error, **exited 0, and installed no core.**
+2. The build line it printed is what cost the most time — see below.
+
+**THE TRAP: `CDCOnBoot=cdc` means CDC *disabled*.** `arduino-cli board details` for
+XIAO_ESP32S3 maps the options the opposite way to how they read:
+
+| USB CDC On Boot | option value |
+|---|---|
+| **Enabled (default)** | `CDCOnBoot=default` |
+| Disabled | `CDCOnBoot=cdc` |
+
+So the old `-b esp32:esp32:XIAO_ESP32S3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi` built
+firmware with **no USB serial at boot**. It flashes and verifies fine and is completely
+silent — indistinguishable from a hung sketch. Two builds were lost to this. **Just use the
+bare FQBN `esp32:esp32:XIAO_ESP32S3`;** its defaults are already hwcdc + CDC enabled.
+
+**Serial gotchas.** Opening the port asserts DTR and resets the S3, so anything printed in
+the first ~2 s is lost to USB CDC re-enumeration — that is why `pads.ino` never showed its
+banner. Put a `delay(3000)` after `Serial.begin()` on a bench sketch. Also: DTR **and** RTS
+asserted together drops the chip into download mode (ROM prints one line, then silence).
+`mon.ps1` asserts DTR only, which is correct. Baud is virtual on native USB CDC.
+
+**The touch driver genuinely hangs — still unsolved.** `pads.merged.bin` never reaches
+`loop()`. Every measurement fails with
+`touch_sensor_trigger_oneshot_scanning(407): Wait for measurement done timeout`,
+on a dead-flat 2065 ms period, on **all six** channels — so it is not wiring and not GPIO5.
+Traced in core 3.3.11 `cores/esp32/esp32-hal-touch-ng.c`:
+- `__touchRead()` (:344) does `__touchInit()` + `__touchChannelInit()` on the **first** call
+  per pin only; later calls are a cheap non-blocking `SMOOTH` read.
+- `__touchChannelInit()` (:310) calls `touchBenchmarkThreshold()` (:331), which burns
+  **3 x `touch_sensor_trigger_oneshot_scanning(handle, 2000)`** (:171) — the 2000 ms is the
+  exact timeout we see. 6 channels x 3 = ~37 s, and it still never recovers afterwards.
+- **`pads.ino`'s `touchSetTiming`/`touchSetConfig` calls are NOT the cause.** They set the
+  driver to values identical to its own defaults (:52-65 — `_chg_times=500`,
+  `TOUCH_VOLT_LIM_L_0V5`, `TOUCH_VOLT_LIM_H_2V2`, sleep 256, measure 32.0f). Removing them
+  changes nothing. The signature is also correct for S3 (`SOC_TOUCH_SENSOR_VERSION == 2`);
+  the `(div_num, coarse, fine)` form is the P4's version-3 branch, not ours.
+
+**Analog sanity check (`t1/t1.ino`, no touch driver).** Streams fine, 160 samples, 10 Hz:
+
+| GPIO | 1 | 2 | 3 | 4 | 5 | 9 |
+|---|---|---|---|---|---|---|
+| mean | 4091 | 0 | 29 | 45 | 4087 | 1941 |
+| | pinned HIGH | pinned LOW | near-gnd | near-gnd | **pinned HIGH** | floating |
+
+GPIO5 at the top rail corroborates the XMOS **I2C SDA pull-up**. GPIO9 swinging randomly
+full-scale is an unconnected input, consistent with it being the untouched spare.
+Caveat: `analogRead` on a high-impedance plate reads whatever pulls the pin, **not** pad
+capacitance — this does not confirm the pad map and will not show a touch.
+
+**Next:** rebuild `pads.ino` from source with the bare FQBN so the banner is visible, then
+attack the benchmark hang — likeliest lever is bypassing `touchBenchmarkThreshold()` by
+driving `driver/touch_sens.h` directly (continuous scanning + `TOUCH_CHAN_DATA_TYPE_RAW`),
+which the kit already flagged as the fallback for attack-blunting.
+
+Still SILENT: no audio, no I2C, XMOS untouched, COM3 never opened.
