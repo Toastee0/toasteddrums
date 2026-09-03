@@ -76,13 +76,29 @@ the first `touchRead()`). Config persists in NVS via `save`.
   CP2102's DTR line drives it — a terminal asserting DTR drops the chip into
   "waiting for download". `watch.ps1` deasserts DTR **and** RTS for this reason.
 
+## Building on Windows
+Rust on the **GNU** toolchain (`stable-x86_64-pc-windows-gnu`; there is no MSVC C++ workload
+on phobos). The one crate, `cpal`, pulls in Microsoft's `windows-*` bindings, and those need
+`dlltool` to build import libraries — rustup's bundled copy fails to spawn, so a real
+mingw-w64 is required: `winget install BrechtSanders.WinLibs.POSIX.UCRT`, which puts
+`mingw64\bin` on the user PATH. Open a new shell after installing it.
+
+**Audio is `cpal`, pinned `=0.18.2`, default features.** It replaced a hand-rolled `waveOut`
+after a pure sine measured an underrun every fourth buffer regardless of pacing: waveOut is a
+shim over the WASAPI shared-mode engine and drains its whole queue once per ~10 ms period,
+so it cannot do sub-period latency. cpal opens the device at its **native rate (48 kHz here)**
+and the mixer pitch-corrects the 44.1 kHz kit with a fractional cursor — asking the device for
+the kit's rate is what made everything play flat and slow. Vetted before adding: RustAudio
+repo, every dependency from the crates.io registry, no git/path sources.
+
 ## Next
-1. **Host-side pad driver**: open the port, `hello` / `go`, turn `h` events into voice
-   triggers. This is the missing link — the engine has no serial input path yet.
-2. `live` command: WASAPI output (kernel FFI, house style) + paint panel 1 over COM9 at step rate.
+1. Play `live` and tune by ear: `set gain <pad> <n>` and `set thresh <pad> <n>` over serial,
+   then `save`. Everything is live except `dur`.
+2. Paint panel 1 over COM9 at hit time (the `vis.rs` frames already exist).
 3. Port ownership: COM9 is held by `annunciator.exe` — decide whether ToastedDrums is a mode of
    annunciator-rs or annunciator.exe exposes a local pipe (see `~/HANDOFF_HISTORY/ANNUNCIATOR_CLIENT_HANDOFF.md`).
 4. Map 4 pads onto 9 voices (bank/shift?), and decide whether pads play live over the
    sequencer or record into the pattern.
-5. Velocity curve: `gain` is currently linear. Real kits want a curve, and it belongs on the
-   host where it can be changed without reflashing.
+5. Velocity curve: `gain` is linear and the level is `(vel/127)²`. Real kits want a shaped
+   curve, and it belongs on the host where it can be changed without reflashing.
+6. Lower latency still: cpal WASAPI **exclusive** mode gets under the 10 ms shared-mode period.

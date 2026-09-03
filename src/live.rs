@@ -1,8 +1,14 @@
 //! live — play the kit from the pads, in real time.
 //!
 //! Ties the three halves together: `pads` (serial hits) → voice triggers → `audio` (winmm
-//! output), with a terminal UI so you can see what the pads are actually doing while you
-//! play them.
+//! output), with a terminal UI so you can see what the pads are doing while you play them.
+//!
+//! THREADING, and why it is not optional: the audio refill runs on its own thread and does
+//! nothing else. It used to share a loop with the terminal redraw, and a Windows console
+//! repaint can block for tens of milliseconds — far longer than the ~12 ms of audio queued —
+//! so the buffers ran dry and the kit came out as a crackling stutter rather than drums.
+//! The main thread reads serial and draws; it sends triggers down a channel and never
+//! touches the audio device.
 //!
 //! Free play, not the sequencer: every hit fires immediately. Recording pads into a pattern
 //! is a separate job and belongs after this feels right to play.
@@ -10,12 +16,85 @@
 use crate::audio::Out;
 use crate::kit::Kit;
 use crate::pads::{Msg, Pads};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 
-/// One sounding sample. Drums are one-shots, so this is just a cursor and a gain.
+/// A strike, on its way to the audio thread. Deliberately tiny and Send: no locks on the
+/// audio path, just a queue.
+struct Trigger {
+    slot: usize,
+    gain: f32,
+}
+
+/// One sounding sample. Drums are one-shots, so this is just a cursor and a gain. The
+/// cursor is fractional, in SOURCE frames: it advances by `Mixer::ratio` per output frame,
+/// which is what pitch-corrects a 44.1 kHz kit onto a 48 kHz device.
 struct Playing {
     slot: usize,
-    pos: usize,
+    pos: f32,
     gain: f32,
+}
+
+/// Owns the samples and the sounding voices. Lives entirely on the audio thread.
+struct Mixer {
+    voices: Vec<Option<Vec<f32>>>,
+    playing: Vec<Playing>,
+    /// kit_rate / device_rate. 1.0 when they match; 0.919 for a 44.1 k kit on a 48 k device.
+    ratio: f32,
+    /// Applied to the summed mix, BEFORE the soft clip. The level curve is (vel/127)², so a
+    /// typical hit at vel ~79 lands at only ~39% amplitude and the kit plays quiet; 2.0 puts
+    /// normal playing where it should be and lets the tanh knee limit hard hits instead of
+    /// leaving headroom nobody uses.
+    master: f32,
+}
+
+/// Default master gain. Overridable per run: `live <kit> [port] [map] [gain]`.
+pub const DEFAULT_MASTER: f32 = 2.0;
+
+impl Mixer {
+    fn start(&mut self, t: Trigger) {
+        // Cheap voice stealing: drums retrigger constantly and an unbounded vector would
+        // grow without limit under a roll.
+        if self.playing.len() >= 24 { self.playing.remove(0); }
+        self.playing.push(Playing { slot: t.slot, pos: 0.0, gain: t.gain });
+    }
+
+    fn mix(&mut self, buf: &mut [f32]) {
+        let voices = &self.voices;
+        let ratio = self.ratio;
+        self.playing.retain_mut(|p| {
+            let v = match voices.get(p.slot).and_then(|v| v.as_ref()) {
+                Some(v) => v,
+                None => return false,
+            };
+            // Linear-interpolating read at a fractional source position. For one-shot
+            // drum hits this is plenty; it is the whole of the resampler and needs no crate.
+            let last = v.len().saturating_sub(1);
+            for o in buf.iter_mut() {
+                let i = p.pos as usize;
+                if i >= last { break; }
+                let frac = p.pos - i as f32;
+                let s = v[i] * (1.0 - frac) + v[i + 1] * frac;
+                *o += s * p.gain;
+                p.pos += ratio;
+            }
+            (p.pos as usize) < last
+        });
+
+        let master = self.master;
+        for o in buf.iter_mut() { *o *= master; }
+
+        // Same soft clip as the offline mixer (seq.rs), so live and `render` sound alike.
+        // This is NOT optional: hit samples already peak near 1.0 and a full-velocity gain
+        // is 1.0, so single strikes sit on the limit and overlapping tails go over it. The
+        // hard clip in audio.rs squares the waveform off, which on a kick is heard as a
+        // flatulent buzz, on a hat as tinny, and on a snare as fuzz. A tanh knee rounds the
+        // peaks instead of shearing them.
+        for o in buf.iter_mut() {
+            if o.abs() > 0.8 {
+                *o = o.signum() * (0.8 + (o.abs() - 0.8).tanh() * 0.2);
+            }
+        }
+    }
 }
 
 /// Rendered meter state per pad, purely for the UI.
@@ -24,22 +103,16 @@ struct Meter {
     decay: f32,
 }
 
-pub struct Live {
-    kit: Kit,
-    /// pad index → kit slot. Pads and voices are different things: four plates onto nine
-    /// voices, so this is a real mapping and not an identity.
+struct Ui {
+    kit_name: String,
+    rate: u32,
+    labels: Vec<String>,
     map: Vec<usize>,
-    playing: Vec<Playing>,
     meters: Vec<Meter>,
     names: Vec<String>,
-    /// Resting baseline per pad, from `get`. Shown in the UI so a mis-calibrated pad is
-    /// visible before you wonder why it will not trigger.
     bases: Vec<u32>,
     hits: u64,
-    /// The device's peak-search window, mirrored here so the UI can report honest total
-    /// latency rather than just the part the host controls.
     hold_ms: u32,
-    /// Rolling log of the last few strikes, newest last.
     log: Vec<String>,
 }
 
@@ -47,53 +120,16 @@ pub struct Live {
 /// the two wall plates are hands (snare, crash).
 pub const DEFAULT_MAP: [usize; 4] = [0, 3, 1, 8];
 
-impl Live {
-    pub fn new(kit: Kit, map: Vec<usize>) -> Live {
-        let n = map.len();
-        Live {
-            kit,
-            map,
-            playing: Vec::with_capacity(32),
-            meters: (0..n).map(|_| Meter { vel: 0, decay: 0.0 }).collect(),
-            names: (0..n).map(|i| format!("pad{i}")).collect(),
-            bases: vec![0; n],
-            hits: 0,
-            hold_ms: 8,
-            log: Vec::new(),
-        }
-    }
-
-    /// Records a pad's real name and resting baseline, learned from `get` at startup.
-    pub fn set_name(&mut self, pad: usize, name: &str, base: u32) {
+impl Ui {
+    fn set_pad(&mut self, pad: usize, name: &str, base: u32) {
         if pad < self.names.len() {
             self.names[pad] = name.to_string();
             self.bases[pad] = base;
         }
     }
 
-    fn trigger(&mut self, pad: usize, name: &str, vel: u8) {
-        if pad >= self.map.len() { return; }
+    fn note_hit(&mut self, pad: usize, name: &str, vel: u8, label: &str) {
         if pad < self.names.len() { self.names[pad] = name.to_string(); }
-        let slot = self.map[pad];
-        let label = match self.kit.voices.get(slot).and_then(|v| v.as_ref()) {
-            Some(v) => v.label.clone(),
-            // A pad mapped to an empty slot is a config mistake, not a crash. Say so in the
-            // log rather than silently dropping the beat.
-            None => {
-                self.log.push(format!("{name} -> slot {slot} is empty"));
-                return;
-            }
-        };
-
-        // Velocity is 1-127 from the device, already scaled by that pad's gain. Square it
-        // for loudness: perceived level tracks power, so linear velocity feels top-heavy.
-        let g = (vel as f32 / 127.0).powi(2);
-
-        // Cheap voice stealing: drums retrigger constantly and an unbounded vector would
-        // grow without limit under a roll.
-        if self.playing.len() >= 24 { self.playing.remove(0); }
-        self.playing.push(Playing { slot, pos: 0, gain: g });
-
         self.hits += 1;
         self.meters[pad].vel = vel;
         self.meters[pad].decay = 1.0;
@@ -101,128 +137,151 @@ impl Live {
         if self.log.len() > 8 { self.log.remove(0); }
     }
 
-    /// Sums every sounding voice into `buf`. Finished voices are dropped.
-    fn mix(&mut self, buf: &mut [f32]) {
-        let voices = &self.kit.voices;
-        self.playing.retain_mut(|p| {
-            let v = match voices.get(p.slot).and_then(|v| v.as_ref()) {
-                Some(v) => v,
-                None => return false,
-            };
-            let n = buf.len().min(v.mono.len().saturating_sub(p.pos));
-            for i in 0..n {
-                buf[i] += v.mono[p.pos + i] * p.gain;
-            }
-            p.pos += n;
-            p.pos < v.mono.len()
-        });
-    }
-
-    fn draw(&self, latency_ms: f32, queued: usize) {
-        // Home the cursor and repaint rather than scrolling, so the meters sit still.
+    fn draw(&self, audio_ms: f32) {
+        // Home the cursor and overwrite, padding each line, rather than clearing the whole
+        // screen. A full clear-and-repaint is markedly more console I/O, and console I/O is
+        // what wrecked the audio when these shared a thread — no reason to keep paying it.
         let mut s = String::with_capacity(1024);
-        s.push_str("\x1b[H\x1b[2J");
-        // Report the whole chain, not just the audio queue. The device's peak-search window
-        // is a latency floor too, and quoting only the part I control would flatter it.
+        s.push_str("\x1b[H");
         s.push_str(&format!(
             "ToastedDrums live — kit '{}' @ {} Hz   latency ~{:.0} ms \
-             (audio {:.1} + pad hold {} + link ~2)   hits {}\n\n",
-            self.kit.name, self.kit.rate,
-            latency_ms + self.hold_ms as f32 + 2.0, latency_ms, self.hold_ms, self.hits));
-        let _ = queued;
+             (audio {:.1} + pad hold {} + link ~2)   hits {}\x1b[K\n\x1b[K\n",
+            self.kit_name, self.rate,
+            audio_ms + self.hold_ms as f32 + 2.0, audio_ms, self.hold_ms, self.hits));
 
         for (i, m) in self.meters.iter().enumerate() {
-            let slot = self.map[i];
-            let label = self.kit.voices.get(slot).and_then(|v| v.as_ref())
-                .map(|v| v.label.as_str()).unwrap_or("(empty)");
+            let label = self.labels.get(self.map[i]).map(String::as_str).unwrap_or("(empty)");
             let lit = (m.decay * 28.0) as usize;
             let bar: String = (0..28).map(|k| if k < lit { '#' } else { '.' }).collect();
-            s.push_str(&format!("  {:<4} → {:<8} {bar} {:>3}   base {:>4}\n",
+            s.push_str(&format!("  {:<4} → {:<8} {bar} {:>3}   base {:>4}\x1b[K\n",
                                 self.names[i], label, m.vel, self.bases[i]));
         }
 
-        s.push('\n');
-        for line in &self.log { s.push_str(&format!("  {line}\n")); }
-        s.push_str("\n  Ctrl-C to stop\n");
+        s.push_str("\x1b[K\n");
+        for line in &self.log { s.push_str(&format!("  {line}\x1b[K\n")); }
+        s.push_str("\x1b[J\n  Ctrl-C to stop\n");
         print!("{s}");
         use std::io::Write;
         let _ = std::io::stdout().flush();
     }
 }
 
-pub fn run(kit: Kit, port: &str, baud: u32, map: Vec<usize>) -> Result<(), String> {
+pub fn run(kit: Kit, port: &str, baud: u32, map: Vec<usize>, master: f32) -> Result<(), String> {
     let rate = kit.rate;
-    let mut live = Live::new(kit, map);
-    let mut out = Out::open(rate)?;
+    let n = map.len();
+
+    // Split the kit: samples go into the audio callback, labels stay here for the UI.
+    let voices: Vec<Option<Vec<f32>>> =
+        kit.voices.iter().map(|v| v.as_ref().map(|v| v.mono.clone())).collect();
+    let labels: Vec<String> = kit.voices.iter()
+        .map(|v| v.as_ref().map(|v| v.label.clone()).unwrap_or_else(|| "(empty)".into()))
+        .collect();
+
+    // Open at the device's native rate and pitch-correct the kit onto it — never ask the
+    // device for the kit's rate (see audio.rs). The ratio has to be known before the
+    // closure is built, hence the separate query.
+    let dev_rate = crate::audio::device_rate()?;
+    let ratio = rate as f32 / dev_rate as f32;
+
+    // cpal owns the audio thread and calls this closure per buffer. It drains pending
+    // triggers, then mixes — no printing, no serial, nothing that can block. The Mixer and
+    // the channel receiver move in and live on that thread for the life of the stream.
+    let (tx, rx): (Sender<Trigger>, Receiver<Trigger>) = channel();
+    let mut mix = Mixer { voices, playing: Vec::with_capacity(32), ratio, master };
+    let out = Out::open(move |buf| {
+        loop {
+            match rx.try_recv() {
+                Ok(t) => mix.start(t),
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        mix.mix(buf);
+    })?;
+
+    let mut ui = Ui {
+        kit_name: kit.name.clone(),
+        rate,
+        labels,
+        map,
+        meters: (0..n).map(|_| Meter { vel: 0, decay: 0.0 }).collect(),
+        names: (0..n).map(|i| format!("pad{i}")).collect(),
+        bases: vec![0; n],
+        hits: 0,
+        hold_ms: 8,
+        log: Vec::new(),
+    };
+
     let mut pads = Pads::open(port, baud)?;
     pads.start("toasteddrums")?;
-    // Hits only: raw windows and traces are calibration tools and would just burn
-    // bandwidth and parse time in the play loop.
+    // Hits only: raw windows and traces are calibration tools and would burn bandwidth and
+    // parse time in the play loop.
     pads.send("mode hits")?;
+    pads.send("trace off")?;
 
     // `hold` is the device's peak-search window: it waits this long after onset to find the
-    // deepest point before reporting, so it is a hard latency floor on every hit. The
-    // default 12 ms is generous — measured strikes reach bottom in roughly 6-8 ms at the
-    // 7-22 %/ms slopes these plates produce — so 8 keeps essentially all of the velocity
-    // range and gives 4 ms back. Live setting, no reboot.
+    // deepest point before reporting, so it is a hard latency floor on every hit.
     pads.send("set hold 8")?;
 
-    // Re-calibrate every session. Baselines are learned in the second after boot, and they
-    // shift a lot with whatever is near the plates — the same pad has measured 74 and 305
-    // on different days. Inheriting a stale baseline from whenever the device last booted
-    // is how pads end up silently unable to reach their threshold.
+    // Re-calibrate every session. The baseline is static once measured, so it matters that
+    // it is measured now, against the room as it is, rather than inherited from whenever
+    // the device last booted.
     eprintln!("calibrating — hands off the pads");
     pads.send("cal")?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2500);
     let mut baselines: Vec<String> = Vec::new();
     while std::time::Instant::now() < deadline {
         for m in pads.poll()? {
-            match m {
-                Msg::Notice(n) if n.starts_with("cal ") => baselines.push(n),
-                Msg::Reply(r) if r.text.starts_with("cal") => {
-                    // calibration finished; drain nothing further
-                }
-                _ => {}
+            if let Msg::Notice(nt) = m {
+                if nt.starts_with("cal ") { baselines.push(nt); }
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    // Names and baselines come out of the `! cal` lines we were already waiting on — no
-    // extra query, no extra wait. `! cal P33 base=524 min=493 max=557 spread=64`.
-    // Ordering matches the device's pad indices, which is the same order it reports hits in.
+    // Names and baselines come out of the `! cal` lines already being read — no extra query.
     for (i, b) in baselines.iter().enumerate() {
         eprintln!("  {b}");
         let f: Vec<&str> = b.split_whitespace().collect();
         if f.len() >= 3 {
             let base = f[2].strip_prefix("base=").and_then(|v| v.parse().ok()).unwrap_or(0);
-            live.set_name(i, f[1], base);
+            ui.set_pad(i, f[1], base);
         }
     }
+
+    let audio_ms = out.latency_ms();
+    print!("\x1b[2J");                                    // clear once; redraws overwrite
 
     let mut last_draw = std::time::Instant::now();
     loop {
         for m in pads.poll()? {
             match m {
-                Msg::Hit(h) => live.trigger(h.pad as usize, &h.name, h.vel),
+                Msg::Hit(h) => {
+                    let pad = h.pad as usize;
+                    if pad >= ui.map.len() { continue; }
+                    let slot = ui.map[pad];
+                    // Velocity is 1-127 from the device, already scaled by that pad's gain.
+                    // Square it for loudness: perceived level tracks power, so linear
+                    // velocity feels top-heavy.
+                    let gain = (h.vel as f32 / 127.0).powi(2);
+                    let label = ui.labels.get(slot).cloned().unwrap_or_default();
+                    if tx.send(Trigger { slot, gain }).is_err() {
+                        return Err("audio thread stopped".into());
+                    }
+                    ui.note_hit(pad, &h.name, h.vel, &label);
+                }
                 Msg::Reply(r) if !r.ok => {
-                    live.log.push(format!("err {} {}", r.code.unwrap_or_default(), r.text));
+                    ui.log.push(format!("err {} {}", r.code.unwrap_or_default(), r.text));
                 }
                 _ => {}
             }
         }
 
-        out.pump(|buf| live.mix(buf))?;
-
-        if last_draw.elapsed().as_millis() >= 40 {
+        if last_draw.elapsed().as_millis() >= 50 {
             let dt = last_draw.elapsed().as_secs_f32();
-            for m in live.meters.iter_mut() {
-                m.decay = (m.decay - dt * 3.0).max(0.0);
-            }
-            let queued = out.queued();
-            live.draw(queued as f32 * 1000.0 / rate as f32, queued);
+            for m in ui.meters.iter_mut() { m.decay = (m.decay - dt * 3.0).max(0.0); }
+            ui.draw(audio_ms);
             last_draw = std::time::Instant::now();
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }

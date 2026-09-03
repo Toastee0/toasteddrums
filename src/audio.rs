@@ -1,167 +1,118 @@
-//! audio — real-time output via winmm `waveOut`. Win32 FFI, zero crates.
+//! audio — real-time output via cpal (WASAPI on Windows).
 //!
-//! WHY waveOut AND NOT WASAPI: WASAPI is the lower-latency path and is where this should
-//! end up (see README "Next"), but it is COM — hand-rolled vtable dispatch, GUIDs and
-//! reference counting, all without crates. waveOut is a flat C API, about a tenth of the
-//! code, and gets a playable kit now. The cost is latency: roughly `BUFFERS * FRAMES /
-//! rate`, so ~23 ms at the defaults here versus ~10 ms for WASAPI shared mode. A drummer
-//! can feel the difference, so this is a first cut and not the final answer.
+//! WHY cpal REPLACED THE HAND-ROLLED waveOut: a pure sine through waveOut measured an
+//! underrun every fourth buffer — 171 in 2 s — and the count was IDENTICAL whether we
+//! spin-slept or blocked on the driver's completion event. That ruled out our pacing and
+//! pointed at the layer below: waveOut on modern Windows is a shim over the WASAPI
+//! shared-mode engine, which runs in ~10 ms periods and drains everything queued in one
+//! gulp per period. A queue near one period is emptied entirely every period, so waveOut
+//! cannot do sub-period latency at all; ~30-50 ms is its floor. The kit needs under 20.
+//! cpal talks to WASAPI directly and can hit that.
 //!
-//! Ownership rule that matters: once a WAVEHDR is handed to `waveOutWrite` the driver owns
-//! it until it sets WHDR_DONE. The headers therefore live in a boxed slice that is never
-//! resized or moved, and we only touch a buffer after seeing that flag.
+//! Supply chain, vetted before adding (the operator's condition): repository is
+//! github.com/RustAudio/cpal, pinned =0.18.2, default features empty, every transitive
+//! dependency resolves from the crates.io registry (no git/path sources), and what builds
+//! on Windows is cpal + dasp_sample + Microsoft's `windows` bindings + dtolnay's proc-macro
+//! trio. Do not loosen the pin casually.
+//!
+//! RATE: we open at the DEVICE'S native rate and channel count and never ask for the kit's.
+//! That is how aire (github.com/Breijen/aire, a working cpal engine) does it, and it is the
+//! difference between correct pitch and "playing slower than intended": asking WASAPI shared
+//! mode for a rate its engine is not running at is either refused or run at the wrong
+//! speed. Sources are pitch-corrected at mix time instead (see live.rs Mixer).
+//!
+//! MODEL: cpal owns the audio thread and calls `fill` for every buffer. The closure must
+//! be fast, allocation-free and never block — no printing, no serial, no locks held long.
 
-const WAVE_MAPPER: u32 = 0xFFFF_FFFF;
-const WAVE_FORMAT_PCM: u16 = 1;
-const CALLBACK_NULL: u32 = 0;
-const WHDR_DONE: u32 = 0x0000_0001;
-const WHDR_PREPARED: u32 = 0x0000_0002;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 
-/// Buffers queued to the driver. More is safer against underrun, worse for latency: the
-/// queue depth IS the output latency. 3 x 128 @ 44.1k is ~8.7 ms, down from 4 x 256 (~23 ms),
-/// which a player can feel. Going lower starts risking audible dropouts when the machine is
-/// busy, and a dropout is far more annoying than a few ms.
-const BUFFERS: usize = 3;
-/// Frames per buffer. 128 @ 44.1k is 2.9 ms.
-const FRAMES: usize = 128;
-
-type HWaveOut = isize;
-
-#[repr(C)]
-struct WaveFormatEx {
-    format_tag: u16,
-    channels: u16,
-    samples_per_sec: u32,
-    avg_bytes_per_sec: u32,
-    block_align: u16,
-    bits_per_sample: u16,
-    cb_size: u16,
-}
-
-#[repr(C)]
-struct WaveHdr {
-    data: *mut u8,
-    buffer_length: u32,
-    bytes_recorded: u32,
-    user: usize,
-    flags: u32,
-    loops: u32,
-    next: *mut WaveHdr,
-    reserved: usize,
-}
-
-#[link(name = "winmm")]
-unsafe extern "system" {
-    fn waveOutOpen(out: *mut HWaveOut, device: u32, fmt: *const WaveFormatEx,
-                   callback: usize, instance: usize, flags: u32) -> u32;
-    fn waveOutPrepareHeader(h: HWaveOut, hdr: *mut WaveHdr, size: u32) -> u32;
-    fn waveOutUnprepareHeader(h: HWaveOut, hdr: *mut WaveHdr, size: u32) -> u32;
-    fn waveOutWrite(h: HWaveOut, hdr: *mut WaveHdr, size: u32) -> u32;
-    fn waveOutReset(h: HWaveOut) -> u32;
-    fn waveOutClose(h: HWaveOut) -> u32;
+/// The default output device's native sample rate. Callers build their fill closure
+/// against this BEFORE opening the stream, since the closure needs to know it.
+pub fn device_rate() -> Result<u32, String> {
+    let device = cpal::default_host().default_output_device().ok_or("no default output device")?;
+    let cfg = device.default_output_config().map_err(|e| format!("no default output config: {e}"))?;
+    Ok(cfg.sample_rate())
 }
 
 pub struct Out {
-    h: HWaveOut,
-    hdrs: Box<[WaveHdr]>,
-    /// Backing store for the headers. Boxed so the pointers we hand the driver stay valid.
-    bufs: Vec<Box<[i16]>>,
+    // Dropping the stream stops it. Kept for exactly that lifetime tie.
+    _stream: cpal::Stream,
     pub rate: u32,
+    pub channels: u16,
+    /// Frames the device has asked us for so far. Lets a caller check the delivered rate
+    /// against wall time — the direct test for "playing slower than intended".
+    frames: Arc<AtomicU64>,
+    /// Frames per callback as actually observed, so the latency we report is real rather
+    /// than the number we asked for.
+    per_call: Arc<AtomicU32>,
 }
 
 impl Out {
-    pub fn open(rate: u32) -> Result<Out, String> {
-        let fmt = WaveFormatEx {
-            format_tag: WAVE_FORMAT_PCM,
-            channels: 1,
-            samples_per_sec: rate,
-            avg_bytes_per_sec: rate * 2,
-            block_align: 2,
-            bits_per_sample: 16,
-            cb_size: 0,
-        };
-        let mut h: HWaveOut = 0;
-        let r = unsafe {
-            waveOutOpen(&mut h, WAVE_MAPPER, &fmt, 0, 0, CALLBACK_NULL)
-        };
-        if r != 0 { return Err(format!("waveOutOpen failed (mmresult {r})")); }
+    /// Opens the default output device at ITS native config, delivering mono through
+    /// `fill` and duplicating it to every hardware channel. `fill` receives a zeroed buffer
+    /// of frames at `device_rate()` and sums into it, in -1.0..1.0.
+    pub fn open<F>(mut fill: F) -> Result<Out, String>
+    where
+        F: FnMut(&mut [f32]) + Send + 'static,
+    {
+        let host = cpal::default_host();
+        let device = host.default_output_device().ok_or("no default output device")?;
+        // A fixed label: the device-name accessor changed across cpal releases and it is
+        // only ever used in log and error strings, so it is not worth coupling to.
+        let name = "default output";
 
-        let mut bufs: Vec<Box<[i16]>> = Vec::with_capacity(BUFFERS);
-        for _ in 0..BUFFERS { bufs.push(vec![0i16; FRAMES].into_boxed_slice()); }
+        let supported = device.default_output_config()
+            .map_err(|e| format!("{name}: no default output config: {e}"))?;
+        let rate = supported.sample_rate();
+        let channels = supported.channels();
+        // Device-native everything, including its default buffer size. Requesting a fixed
+        // small buffer is the other thing WASAPI shared mode is prone to refusing.
+        let config: cpal::StreamConfig = supported.into();
 
-        let mut hdrs: Vec<WaveHdr> = Vec::with_capacity(BUFFERS);
-        for b in bufs.iter_mut() {
-            hdrs.push(WaveHdr {
-                data: b.as_mut_ptr() as *mut u8,
-                buffer_length: (FRAMES * 2) as u32,
-                bytes_recorded: 0,
-                user: 0,
-                // Start marked DONE so the first fill pass treats them all as free.
-                flags: WHDR_DONE,
-                loops: 0,
-                next: std::ptr::null_mut(),
-                reserved: 0,
-            });
-        }
-        let mut hdrs = hdrs.into_boxed_slice();
+        let frames = Arc::new(AtomicU64::new(0));
+        let per_call = Arc::new(AtomicU32::new(0));
+        let (counter, seen) = (frames.clone(), per_call.clone());
+        let ch = channels as usize;
+        let mut mono: Vec<f32> = Vec::new();
 
-        for hd in hdrs.iter_mut() {
-            let r = unsafe { waveOutPrepareHeader(h, hd, std::mem::size_of::<WaveHdr>() as u32) };
-            if r != 0 {
-                unsafe { waveOutClose(h) };
-                return Err(format!("waveOutPrepareHeader failed (mmresult {r})"));
-            }
-            hd.flags |= WHDR_DONE;
-        }
-
-        Ok(Out { h, hdrs, bufs, rate })
-    }
-
-    /// Frames the driver still holds — a rough queue depth for the caller's benefit.
-    pub fn queued(&self) -> usize {
-        self.hdrs.iter().filter(|hd| hd.flags & WHDR_DONE == 0).count() * FRAMES
-    }
-
-    /// Tops the queue back up, calling `fill` once per free buffer. `fill` writes exactly
-    /// FRAMES mono samples in -1.0..1.0; anything outside is clipped rather than wrapped,
-    /// because wrapping a drum transient sounds like a gunshot.
-    pub fn pump<F: FnMut(&mut [f32])>(&mut self, mut fill: F) -> Result<(), String> {
-        let mut scratch = [0f32; FRAMES];
-        for i in 0..self.hdrs.len() {
-            if self.hdrs[i].flags & WHDR_DONE == 0 { continue; }
-
-            for s in scratch.iter_mut() { *s = 0.0; }
-            fill(&mut scratch);
-
-            let buf = &mut self.bufs[i];
-            for (d, s) in buf.iter_mut().zip(scratch.iter()) {
-                let v = if *s > 1.0 { 1.0 } else if *s < -1.0 { -1.0 } else { *s };
-                *d = (v * 32767.0) as i16;
-            }
-
-            self.hdrs[i].flags &= !WHDR_DONE;
-            let r = unsafe {
-                waveOutWrite(self.h, &mut self.hdrs[i], std::mem::size_of::<WaveHdr>() as u32)
-            };
-            if r != 0 {
-                self.hdrs[i].flags |= WHDR_DONE;
-                return Err(format!("waveOutWrite failed (mmresult {r})"));
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Drop for Out {
-    fn drop(&mut self) {
-        unsafe {
-            waveOutReset(self.h);            // reclaim every queued buffer first
-            for hd in self.hdrs.iter_mut() {
-                if hd.flags & WHDR_PREPARED != 0 {
-                    waveOutUnprepareHeader(self.h, hd, std::mem::size_of::<WaveHdr>() as u32);
+        let stream = device.build_output_stream(
+            config,
+            move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let n = out.len() / ch;
+                if mono.len() < n { mono.resize(n, 0.0); }
+                let m = &mut mono[..n];
+                for s in m.iter_mut() { *s = 0.0; }
+                fill(m);
+                // Mono into every channel, with a hard clamp as the final safety net —
+                // a wrapped drum transient sounds like a gunshot. The musical soft clip
+                // happens upstream in the mixer.
+                for (i, frame) in out.chunks_mut(ch).enumerate() {
+                    let v = m[i].clamp(-1.0, 1.0);
+                    for s in frame.iter_mut() { *s = v; }
                 }
-            }
-            waveOutClose(self.h);
-        }
+                counter.fetch_add(n as u64, Ordering::Relaxed);
+                seen.store(n as u32, Ordering::Relaxed);
+            },
+            move |e| eprintln!("audio stream error: {e}"),
+            None,
+        ).map_err(|e| format!("{name}: build_output_stream: {e}"))?;
+
+        stream.play().map_err(|e| format!("{name}: play: {e}"))?;
+        eprintln!("audio: {name}, {rate} Hz native, {channels} ch");
+
+        Ok(Out { _stream: stream, rate, channels, frames, per_call })
+    }
+
+    /// Total frames delivered to the device since open.
+    pub fn frames_delivered(&self) -> u64 {
+        self.frames.load(Ordering::Relaxed)
+    }
+
+    /// Our share of the output latency: one callback's worth of frames, as observed. The
+    /// engine may add a period of its own on top in shared mode.
+    pub fn latency_ms(&self) -> f32 {
+        self.per_call.load(Ordering::Relaxed) as f32 * 1000.0 / self.rate as f32
     }
 }

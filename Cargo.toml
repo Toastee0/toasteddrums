@@ -9,6 +9,7 @@ name = "toasteddrums"
 path = "src/main.rs"
 
 [dependencies]
+cpal = "=0.18.2"
 
 [profile.release]
 opt-level = 2

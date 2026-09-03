@@ -21,6 +21,13 @@ fn main() {
     let r = match a.get(1).map(String::as_str) {
         Some("render") if a.len() >= 5 => render(&a[2], &a[3], &a[4], a.get(5).and_then(|b| b.parse().ok()).unwrap_or(2)),
         Some("show") if a.len() >= 4 => show(&a[2], &a[3]),
+        // Diagnostic: push a known-good file straight through the output layer, bypassing
+        // the pads and the live mixer. If THIS crackles, audio.rs is at fault; if it is
+        // clean, the fault is upstream in how live mixes.
+        Some("play") if a.len() >= 3 => play_wav(&a[2]),
+        // Purer still: a synthesised sine, no file involved at all. The cleanest possible
+        // test of the output layer. Optional Hz, default 110.
+        Some("tone") => play_tone(a.get(2).and_then(|s| s.parse().ok()).unwrap_or(110.0)),
         Some("pads") => watch_pads(
             a.get(2).map(String::as_str).unwrap_or("COM5"),
             a.get(3).and_then(|b| b.parse().ok()).unwrap_or(115200),
@@ -36,19 +43,20 @@ fn main() {
             };
             go_live(kit_arg,
                     a.get(rest).map(String::as_str).unwrap_or("COM5"),
-                    a.get(rest + 1).map(String::as_str))
+                    a.get(rest + 1).map(String::as_str),
+                    a.get(rest + 2).and_then(|g| g.parse().ok()).unwrap_or(live::DEFAULT_MASTER))
         }
         _ => Err(concat!(
             "usage: toasteddrums render <kit> <pattern> <out.wav> [bars]\n",
             "                  show   <kit> <pattern>\n",
             "                  pads   [port] [baud]\n",
-            "                  live   <kit> [port] [map]      map e.g. 0,3,1,8 = pad→slot",
+            "                  live   <kit> [port] [map] [gain]   map e.g. 0,3,1,8 = pad→slot; gain default 2.0",
         ).into()),
     };
     if let Err(e) = r { eprintln!("toasteddrums: {e}"); std::process::exit(1); }
 }
 
-fn go_live(kit_path: &str, port: &str, map_arg: Option<&str>) -> Result<(), String> {
+fn go_live(kit_path: &str, port: &str, map_arg: Option<&str>, master: f32) -> Result<(), String> {
     let k = kit::Kit::load(&find_data(kit_path)?)?;
     let map: Vec<usize> = match map_arg {
         Some(s) => {
@@ -61,7 +69,73 @@ fn go_live(kit_path: &str, port: &str, map_arg: Option<&str>) -> Result<(), Stri
         }
         None => live::DEFAULT_MAP.to_vec(),
     };
-    live::run(k, port, 115200, map)
+    live::run(k, port, 115200, map, master)
+}
+
+/// Plays a WAV through audio.rs and nothing else. No pads, no mixer, no threads: if this
+/// is clean the output layer is sound and the fault is upstream; if it crackles, audio.rs
+/// itself is broken. `render`'s output is the natural input, since seq.rs is known good.
+fn play_wav(path: &str) -> Result<(), String> {
+    let p = find_data(path)?;
+    let bytes = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+    let w = wav::Wav::parse(&bytes)?;
+    let mono = w.mono();
+    let peak = mono.iter().fold(0f32, |m, s| m.max(s.abs()));
+    eprintln!("{}: {} Hz, {} frames ({:.2} s), peak {peak:.3}",
+              p.display(), w.rate, mono.len(), mono.len() as f32 / w.rate as f32);
+
+    let secs = mono.len() as f32 / w.rate as f32;
+    // Device-native rate; pitch-correct the file onto it with a fractional cursor, the
+    // same way live.rs does. Asking the device for the file's rate is the bug we just fixed.
+    let dev = audio::device_rate()?;
+    let ratio = w.rate as f32 / dev as f32;
+    let last = mono.len().saturating_sub(1);
+    let mut pos = 0f32;
+    let t0 = std::time::Instant::now();
+    let out = audio::Out::open(move |buf| {
+        for o in buf.iter_mut() {
+            let i = pos as usize;
+            if i >= last { break; }
+            let frac = pos - i as f32;
+            *o = mono[i] * (1.0 - frac) + mono[i + 1] * frac;
+            pos += ratio;
+        }
+    })?;
+    std::thread::sleep(std::time::Duration::from_secs_f32(secs + 0.2));
+    report_rate(&out, t0);
+    Ok(())
+}
+
+/// The direct test for "playing slower than intended": frames the device consumed divided
+/// by wall time should equal the sample rate. Gaps or stalls show up as a low number.
+fn report_rate(out: &audio::Out, t0: std::time::Instant) {
+    let elapsed = t0.elapsed().as_secs_f32();
+    let frames = out.frames_delivered();
+    let effective = frames as f32 / elapsed;
+    eprintln!("done. {frames} frames in {elapsed:.2} s = {effective:.0} Hz effective (device {}; \
+               {:.1}% of target)  ~{:.1} ms per callback",
+              out.rate, effective / out.rate as f32 * 100.0, out.latency_ms());
+}
+
+/// Two seconds of sine at `hz`, generated on the fly, through audio.rs. Nothing else in the
+/// chain — no WAV, no mixer, no pads. A sine is the one signal where any crackle, buzz or
+/// stutter is unambiguously the output layer's doing.
+fn play_tone(hz: f32) -> Result<(), String> {
+    // Generated directly at the device's rate, so the pitch is exact by construction.
+    let rate = audio::device_rate()?;
+    eprintln!("sine {hz} Hz, 2 s, amplitude 0.5, at device rate {rate} Hz");
+    let mut n = 0usize;
+    let step = 2.0 * std::f32::consts::PI * hz / rate as f32;
+    let t0 = std::time::Instant::now();
+    let out = audio::Out::open(move |buf| {
+        for s in buf.iter_mut() {
+            *s = 0.5 * (n as f32 * step).sin();
+            n += 1;
+        }
+    })?;
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    report_rate(&out, t0);
+    Ok(())
 }
 
 /// Opens the controller, does the PROTOCOL.md handshake, and prints hits until Ctrl-C.
