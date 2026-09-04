@@ -15,7 +15,7 @@
 
 use crate::audio::Out;
 use crate::kit::Kit;
-use crate::pads::{Msg, Pads};
+use crate::pads::{Learn, Msg, Pads};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 
 /// A strike, on its way to the audio thread. Deliberately tiny and Send: no locks on the
@@ -211,45 +211,20 @@ pub fn run(kit: Kit, port: &str, baud: u32, map: Vec<usize>, master: f32) -> Res
         log: Vec::new(),
     };
 
+    // The session, calibration and learn phase are the shared implementation in pads.rs --
+    // the MCP server runs the identical sequence. This function only owns the terminal
+    // narration around it.
     let mut pads = Pads::open(port, baud)?;
-    pads.start("toasteddrums")?;
-    // Hits only: raw windows and traces are calibration tools and would burn bandwidth and
-    // parse time in the play loop.
-    pads.send("mode hits")?;
-    pads.send("trace off")?;
-
-    // `hold` is the device's peak-search window: it waits this long after onset to find the
-    // deepest point before reporting, so it is a hard latency floor on every hit.
-    pads.send("set hold 8")?;
+    pads.session_start("toasteddrums")?;
 
     // Re-calibrate every session. The baseline is static once measured, so it matters that
     // it is measured now, against the room as it is, rather than inherited from whenever
     // the device last booted.
     eprintln!("calibrating — hands off the pads");
-    pads.send("cal")?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2500);
-    let mut baselines: Vec<String> = Vec::new();
-    while std::time::Instant::now() < deadline {
-        for m in pads.poll()? {
-            if let Msg::Notice(nt) = m {
-                if nt.starts_with("cal ") { baselines.push(nt); }
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    // Names, baselines and NOISE FLOORS come out of the `! cal` lines already being read.
-    // `! cal P2 base=152 min=146 max=160 spread=14` — spread is max-min over the 1 s
-    // window, i.e. the peak-to-peak noise while untouched. That number is the whole basis
-    // for the learn phase below: anything a safe multiple above it is a real tap.
-    let mut spreads: Vec<f32> = vec![0.0; n];
-    for (i, b) in baselines.iter().enumerate() {
-        eprintln!("  {b}");
-        let f: Vec<&str> = b.split_whitespace().collect();
-        let field = |k: &str| f.iter().find_map(|t| t.strip_prefix(k)).and_then(|v| v.parse::<f32>().ok());
-        if f.len() >= 3 {
-            ui.set_pad(i, f[1], field("base=").unwrap_or(0.0) as u32);
-            if i < n { spreads[i] = field("spread=").unwrap_or(0.0); }
-        }
+    let cal = pads.calibrate(std::time::Duration::from_millis(2500))?;
+    for c in &cal {
+        eprintln!("  {}", c.describe());
+        ui.set_pad(c.pad, &c.name, c.base);
     }
 
     // ---- learn phase: three taps per pad set that pad's thresh and gain -----------------
@@ -259,26 +234,20 @@ pub fn run(kit: Kit, port: &str, baud: u32, map: Vec<usize>, master: f32) -> Res
     // Learn them every time instead. During learning the trigger sits at 2x the noise
     // floor so any genuine tap registers without the noise doing so.
     eprintln!("untouched state OK — tap each pad 3 times please");
-    for i in 0..n {
-        let learn_thresh = (spreads[i] * 2.0).max(10.0);
-        pads.send(&format!("set thresh {i} {learn_thresh:.0}"))?;
-    }
-    let mut depths: Vec<Vec<f32>> = vec![Vec::new(); n];
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    pads.set_learn_thresholds(&cal)?;
+    let mut learn = Learn::new(&cal, std::time::Duration::from_secs(90));
     let mut last_report = std::time::Instant::now();
-    while std::time::Instant::now() < deadline && depths.iter().any(|d| d.len() < 3) {
+    while !learn.done() {
         for m in pads.poll()? {
             if let Msg::Hit(h) = m {
-                let p = h.pad as usize;
-                if p < n && depths[p].len() < 3 {
-                    depths[p].push(h.depth);
-                    eprintln!("  {:<4} tap {}/3  drop {:.0} counts", h.name, depths[p].len(), h.depth);
+                if let Some((_, count)) = learn.feed(&h) {
+                    eprintln!("  {:<4} tap {count}/3  drop {:.0} counts", h.name, h.depth);
                 }
             }
         }
         if last_report.elapsed().as_secs() >= 10 {
-            let waiting: Vec<String> = (0..n).filter(|&i| depths[i].len() < 3)
-                .map(|i| format!("{} ({}/3)", ui.names[i], depths[i].len())).collect();
+            let waiting: Vec<String> = learn.pending().iter()
+                .map(|&(i, c)| format!("{} ({c}/3)", ui.names[i])).collect();
             eprintln!("  still need: {}", waiting.join(", "));
             last_report = std::time::Instant::now();
         }
@@ -286,24 +255,16 @@ pub fn run(kit: Kit, port: &str, baud: u32, map: Vec<usize>, master: f32) -> Res
     }
 
     eprintln!("learned:");
-    for i in 0..n {
-        if depths[i].is_empty() {
+    for (i, r) in learn.results().iter().enumerate() {
+        match r {
             // Nothing tapped: leave the learn threshold in place rather than inventing a
             // gain. The pad still triggers; its velocity will just be uncalibrated.
-            eprintln!("  {:<4} no taps — keeping learn threshold, velocity uncalibrated", ui.names[i]);
-            continue;
+            None => eprintln!("  {:<4} no taps — keeping learn threshold, velocity uncalibrated", ui.names[i]),
+            Some((thresh, gain)) => {
+                pads.apply_learned(i, *thresh, *gain)?;
+                eprintln!("  {:<4} → thresh {thresh:.0}  gain {gain:.0}", ui.names[i]);
+            }
         }
-        // Median of the taps, so one weak or one wild tap does not set the scale.
-        let mut d = depths[i].clone();
-        d.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let typical = d[d.len() / 2];
-        // thresh: half a typical hit, but never inside the noise floor.
-        // gain:   1.6x a typical hit, so normal playing lands near vel 80 with headroom above.
-        let thresh = (typical * 0.5).max(spreads[i] * 2.0).max(10.0);
-        let gain = typical * 1.6;
-        pads.send(&format!("set thresh {i} {thresh:.0}"))?;
-        pads.send(&format!("set gain {i} {gain:.0}"))?;
-        eprintln!("  {:<4} typical drop {typical:.0}  → thresh {thresh:.0}  gain {gain:.0}", ui.names[i]);
     }
     // Drain the acks so they do not land in the play log.
     std::thread::sleep(std::time::Duration::from_millis(150));

@@ -271,6 +271,189 @@ impl Drop for Pads {
     }
 }
 
+// ---- session, calibration and learn: the reusable half ----------------------------------
+// live.rs and the MCP server both need the same startup and the same three-tap learn. This
+// is the single implementation. The pure part (`Learn`) has no I/O so it can be unit-tested.
+
+/// One `! cal <name> base=<b> min=.. max=.. spread=<s>` line, by pad index.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CalLine {
+    pub pad: usize,
+    pub name: String,
+    pub base: u32,
+    pub min: u32,
+    pub max: u32,
+    /// max-min over the calibration second: the peak-to-peak noise while untouched
+    pub spread: f32,
+}
+
+impl CalLine {
+    /// The device's own wording, so a host can echo exactly what `! cal` said.
+    pub fn describe(&self) -> String {
+        format!("cal {} base={} min={} max={} spread={:.0}", self.name, self.base, self.min, self.max, self.spread)
+    }
+}
+
+impl Pads {
+    /// `hello` + `go`, then the play-mode settings every host wants: hits only (raw windows
+    /// and traces are calibration tools), and an 8 ms peak-search window.
+    pub fn session_start(&mut self, who: &str) -> Result<(), String> {
+        self.start(who)?;
+        self.send("mode hits")?;
+        self.send("trace off")?;
+        self.send("set hold 8")
+    }
+
+    /// Runs the device's 1 s calibration and collects its per-pad results. Baselines are
+    /// static once measured, so this is the moment they are measured -- against the room as
+    /// it is now, not whenever the device last booted.
+    ///
+    /// The results are read from `! cal` notices. PROTOCOL.md 5.6 says notices are not for
+    /// control flow, and the authoritative machine-readable state is `get` -> `p` lines; the
+    /// notices are used here because they are the only place `spread` (the noise floor) is
+    /// reported. Ordering is the device's pad order, which matches hit indices.
+    pub fn calibrate(&mut self, wait: std::time::Duration) -> Result<Vec<CalLine>, String> {
+        self.send("cal")?;
+        let mut out = Vec::new();
+        let deadline = std::time::Instant::now() + wait;
+        while std::time::Instant::now() < deadline {
+            for m in self.poll()? {
+                if let Msg::Notice(n) = m {
+                    if let Some(rest) = n.strip_prefix("cal ") {
+                        let f: Vec<&str> = rest.split_whitespace().collect();
+                        let field = |k: &str| f.iter().find_map(|t| t.strip_prefix(k)).and_then(|v| v.parse::<f32>().ok());
+                        out.push(CalLine {
+                            pad: out.len(),
+                            name: f.first().unwrap_or(&"?").to_string(),
+                            base: field("base=").unwrap_or(0.0) as u32,
+                            min: field("min=").unwrap_or(0.0) as u32,
+                            max: field("max=").unwrap_or(0.0) as u32,
+                            spread: field("spread=").unwrap_or(0.0),
+                        });
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(out)
+    }
+
+    /// Sets each pad's trigger at twice its noise floor: any genuine tap registers, noise
+    /// does not. This is the state a `Learn` runs in.
+    pub fn set_learn_thresholds(&mut self, cal: &[CalLine]) -> Result<(), String> {
+        for c in cal { self.send(&format!("set thresh {} {:.0}", c.pad, (c.spread * 2.0).max(10.0)))?; }
+        Ok(())
+    }
+
+    pub fn apply_learned(&mut self, pad: usize, thresh: f32, gain: f32) -> Result<(), String> {
+        self.send(&format!("set thresh {pad} {thresh:.0}"))?;
+        self.send(&format!("set gain {pad} {gain:.0}"))
+    }
+}
+
+/// The three-taps-per-pad learn, as pure state: feed it hits, ask if it is done, read the
+/// results. Thresholds are absolute counts and a pad's swing depends on its mounting and
+/// its striker (floor plates on carpet dropped ~50 counts, on blocks 80+; a shoe couples far
+/// more weakly than a hand), so this runs every session and the numbers are never carried.
+pub struct Learn {
+    depths: Vec<Vec<f32>>,
+    spreads: Vec<f32>,
+    deadline: std::time::Instant,
+}
+
+impl Learn {
+    pub fn new(cal: &[CalLine], timeout: std::time::Duration) -> Learn {
+        Learn {
+            depths: vec![Vec::new(); cal.len()],
+            spreads: cal.iter().map(|c| c.spread).collect(),
+            deadline: std::time::Instant::now() + timeout,
+        }
+    }
+
+    /// Records a hit's depth if that pad still needs taps. Returns (pad, taps so far).
+    pub fn feed(&mut self, h: &Hit) -> Option<(usize, usize)> {
+        let p = h.pad as usize;
+        let d = self.depths.get_mut(p)?;
+        if d.len() >= 3 { return None; }
+        d.push(h.depth);
+        Some((p, d.len()))
+    }
+
+    /// True once every pad has three taps or the timeout has passed. Never true with zero
+    /// pads -- an empty learn is not a finished one.
+    pub fn done(&self) -> bool {
+        !self.depths.is_empty()
+            && (self.depths.iter().all(|d| d.len() >= 3) || std::time::Instant::now() >= self.deadline)
+    }
+
+    /// Pads still short of three taps, as (pad, count).
+    pub fn pending(&self) -> Vec<(usize, usize)> {
+        self.depths.iter().enumerate().filter(|(_, d)| d.len() < 3).map(|(i, d)| (i, d.len())).collect()
+    }
+
+    /// Per pad: (thresh, gain), or None if it was never tapped. thresh is half a typical
+    /// hit but never inside the noise floor; gain is 1.6x a typical hit so normal playing
+    /// lands near velocity 80 with room above.
+    pub fn results(&self) -> Vec<Option<(f32, f32)>> {
+        self.depths.iter().zip(&self.spreads).map(|(d, &spread)| {
+            if d.is_empty() { return None; }
+            let mut v = d.clone();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let typical = v[v.len() / 2];
+            Some(((typical * 0.5).max(spread * 2.0).max(10.0), typical * 1.6))
+        }).collect()
+    }
+}
+
+#[cfg(test)]
+mod learn_tests {
+    use super::*;
+
+    fn hit(pad: u8, depth: f32) -> Hit {
+        Hit { pad, name: format!("P{pad}"), vel: 100, t_ms: 0, depth, slope: 0.0, base: 500, min: 0 }
+    }
+    fn cal(spreads: &[f32]) -> Vec<CalLine> {
+        spreads.iter().enumerate().map(|(i, &s)| CalLine {
+            pad: i, name: format!("P{i}"), base: 500, min: 500 - s as u32 / 2, max: 500 + s as u32 / 2, spread: s,
+        }).collect()
+    }
+
+    #[test]
+    fn empty_learn_is_never_done() {
+        let l = Learn::new(&[], std::time::Duration::from_secs(0));
+        assert!(!l.done());
+    }
+
+    #[test]
+    fn three_taps_per_pad_finishes_and_derives_thresholds() {
+        let mut l = Learn::new(&cal(&[10.0, 60.0]), std::time::Duration::from_secs(60));
+        for d in [50.0, 48.0, 55.0] { l.feed(&hit(0, d)); }
+        assert!(!l.done());
+        for d in [300.0, 280.0, 320.0] { l.feed(&hit(1, d)); }
+        assert!(l.done());
+        assert_eq!(l.feed(&hit(0, 99.0)), None, "a fourth tap is ignored");
+        let r = l.results();
+        assert_eq!(r[0], Some((25.0, 80.0)));           // median 50: thresh 25, gain 80
+        assert_eq!(r[1], Some((150.0, 480.0)));         // median 300
+    }
+
+    #[test]
+    fn threshold_never_sinks_into_the_noise_floor() {
+        let mut l = Learn::new(&cal(&[40.0]), std::time::Duration::from_secs(60));
+        for d in [30.0, 30.0, 30.0] { l.feed(&hit(0, d)); }
+        // half of 30 is 15, but the floor is 2*40 = 80
+        assert_eq!(l.results()[0], Some((80.0, 48.0)));
+    }
+
+    #[test]
+    fn untapped_pad_yields_none_and_timeout_finishes() {
+        let l = Learn::new(&cal(&[10.0, 10.0]), std::time::Duration::from_secs(0));
+        assert!(l.done(), "timed out counts as done");
+        assert_eq!(l.results(), vec![None, None]);
+        assert_eq!(l.pending(), vec![(0, 0), (1, 0)]);
+    }
+}
+
 /// Splits an optional leading `#<seq>` off a reply body.
 fn take_seq<'a>(f: &[&'a str]) -> (Option<u16>, usize) {
     match f.first().and_then(|t| t.strip_prefix('#')).and_then(|d| d.parse().ok()) {

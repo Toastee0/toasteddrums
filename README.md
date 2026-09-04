@@ -68,8 +68,8 @@ the first `touchRead()`). Config persists in NVS via `save`.
 ### Facts that cost time (full list in `kit/PHOBOS_KIT.md`)
 - Values **fall** when touched on this chip. Hits are 60–70% deflections.
 - Baselines differ hugely by mounting (wall ~500–700, floor on carpet ~140–450), and ambient
-  drift is the same size as a hit — so every threshold is a **percentage of that pad's own
-  tracked baseline**, never an absolute count.
+  drift is the same size as a hit — so thresholds are **absolute counts, per pad, learned from three taps each session**
+  (percentages were tried and removed -- see PROTOCOL.md 6.1).
 - A shoe sole is a thick dielectric; a hand on bare metal is nearly direct contact. Foot pads
   couple far more weakly for equal effort. Hence per-pad tuning.
 - Never use GPIO0 as a pad: it is the BOOT strap, its pull-up clamps it to a flat 0, and the
@@ -100,14 +100,34 @@ the kit learns *that* strike on *that* mounting, and a hand on a foot-tuned pad 
 overdrive it — which is the sign it's measuring something real. A pad left untapped keeps
 its learn threshold and reports uncalibrated velocity rather than inventing a gain.
 
+## The tracker: one engine, two doors
+
+`toasteddrums mcp [kit] [pads-port] [door-port]` runs the engine as a long-lived process that
+owns the audio device, the pads and the song, and exposes the same verbs two ways:
+
+- **MCP over stdio** (`.mcp.json` registers it for Claude Code) — so Claude can write patterns,
+  swap kits, arm modifiers, record from the pads and render, in the conversation.
+- **A localhost TCP door** (`127.0.0.1:<door-port>`, same newline-delimited JSON-RPC, same tool
+  names) — for the operator UI. Both edit ONE song; there are never two copies.
+
+The song model (`src/song.rs`) is JSON end to end: a BPM and any number of **tracks**, each
+with its own length in sixteenths (16 = 4/4, 12 = 3/4, 14 = 7/8 …) looping independently, so
+polymeter is the default. Each cell holds hits, and each hit carries its own **mods** — pitch,
+drive, crush, reverse, gain, decay — applied at mix time for *that* hit only. That is the
+"any modifier, any note" rule. Tracks carry a pad map (which slot each plate plays while the
+track is the context) and a MIDI key map.
+
+Tools: `status song_get song_set song_save song_load track_add track_set track_clear hit_set
+hit_add fill mods_apply play stop bpm master trigger kit_load kit_info render pads_open
+pads_learn pads_context record arm`. `tools/list` carries the schemas. Verified over stdio:
+12/12 replies, nothing but protocol on stdout, `bpm` changes mid-play without a glitch.
+
+The pads session (`hello`/`go`/`cal`) and the three-tap learn live once, in `src/pads.rs`
+(`session_start`, `calibrate`, `Learn`), and `live` and `mcp` both use them.
+
 ## Next
-1. Learn-phase UX: a way to redo one pad mid-session without restarting, and a keypress to
-   skip the taps when you just want the last numbers back.
-2. Paint panel 1 over COM9 at hit time (the `vis.rs` frames already exist).
-3. Port ownership: COM9 is held by `annunciator.exe` — decide whether ToastedDrums is a mode of
-   annunciator-rs or annunciator.exe exposes a local pipe (see `~/HANDOFF_HISTORY/ANNUNCIATOR_CLIENT_HANDOFF.md`).
-4. Map 4 pads onto 9 voices (bank/shift?), and decide whether pads play live over the
-   sequencer or record into the pattern.
-5. Velocity curve: `gain` is linear and the level is `(vel/127)²`. Real kits want a shaped
-   curve, and it belongs on the host where it can be changed without reflashing.
-6. Lower latency still: cpal WASAPI **exclusive** mode gets under the 10 ms shared-mode period.
+1. MIDI input from the Casio over USB (winmm, zero crates): drum mode (notes -> slots) and
+   chromatic mode (one slot pitched by note) with its own recording context.
+2. The operator UI on the TCP door: eframe/egui, pinned and vetted like every other crate.
+3. Paint panel 1 over COM9 at hit time (the `vis.rs` frames already exist).
+4. Lower latency still: cpal WASAPI **exclusive** mode gets under the 10 ms shared-mode period.

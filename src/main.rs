@@ -9,8 +9,10 @@
 mod audio;
 mod kit;
 mod live;
+mod mcp;
 mod pads;
 mod seq;
+mod song;
 mod vis;
 mod wav;
 
@@ -21,6 +23,13 @@ fn main() {
     let r = match a.get(1).map(String::as_str) {
         Some("render") if a.len() >= 5 => render(&a[2], &a[3], &a[4], a.get(5).and_then(|b| b.parse().ok()).unwrap_or(2)),
         Some("show") if a.len() >= 4 => show(&a[2], &a[3]),
+        // The tracker as an MCP server over stdio: `mcp [kit] [pads-port] [door-port]`.
+        // Nothing but protocol may go to stdout in this mode. This arm yields a Result like
+        // every other -- `?` cannot be used in `fn main`, which returns ().
+        Some("mcp") => find_data(a.get(2).map(String::as_str).unwrap_or("kits/bigbeat.kit"))
+            .and_then(|p| mcp::serve(&p.display().to_string(),
+                                     a.get(3).map(String::as_str),
+                                     a.get(4).and_then(|s| s.parse().ok()))),
         // Diagnostic: push a known-good file straight through the output layer, bypassing
         // the pads and the live mixer. If THIS crackles, audio.rs is at fault; if it is
         // clean, the fault is upstream in how live mixes.
@@ -50,7 +59,9 @@ fn main() {
             "usage: toasteddrums render <kit> <pattern> <out.wav> [bars]\n",
             "                  show   <kit> <pattern>\n",
             "                  pads   [port] [baud]\n",
-            "                  live   <kit> [port] [map] [gain]   map e.g. 0,3,1,8 = pad→slot; gain default 2.0",
+            "                  live   <kit> [port] [map] [gain]   map e.g. 0,3,1,8 = pad→slot; gain default 2.0\n",
+            "                  mcp    [kit] [pads-port] [door-port]   MCP server on stdio (kit default kits/bigbeat.kit)\n",
+            "                  play   <wav> | tone [hz]          output-layer diagnostics",
         ).into()),
     };
     if let Err(e) = r { eprintln!("toasteddrums: {e}"); std::process::exit(1); }

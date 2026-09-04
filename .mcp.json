@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "toasteddrums": {
+      "command": "./target/release/toasteddrums.exe",
+      "args": ["mcp", "kits/bigbeat.kit"]
+    }
+  }
+}
