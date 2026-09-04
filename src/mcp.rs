@@ -18,6 +18,7 @@
 
 use crate::audio::{device_rate, Out};
 use crate::kit::Kit;
+use crate::midi::Midi;
 use crate::pads::{Learn, Msg, Pads};
 use crate::song::{quantise, Cmd, Hit, Mods, Resampler, Song, Track, Transport};
 use serde_json::{json, Value};
@@ -27,6 +28,26 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex, RwLock};
+
+/// How the keyboard plays. Drums: notes map to kit slots through the context track's key
+/// map. Chromatic: every note plays ONE slot, pitched by `2^((note-root)/12)` — the existing
+/// per-hit pitch mod, so any sample or the synth kick becomes a bass or a lead.
+#[derive(Clone, Debug)]
+enum KeysMode {
+    Drums,
+    Chromatic { slot: usize, root: u8 },
+}
+
+/// The keyboard's own context, independent of the pads': its track, its mode, and (in the
+/// studio) its own armed mods — so bass on the keys and drums on the feet record into
+/// different tracks in one take.
+#[derive(Clone, Debug)]
+struct MidiState {
+    id: u32,
+    name: String,
+    mode: KeysMode,
+    track: usize,
+}
 
 struct PadsState {
     tx: Sender<String>,          // commands to the pads thread ("learn", or raw serial)
@@ -48,6 +69,8 @@ struct Studio {
     recording: AtomicBool,
     armed: Mutex<Mods>,          // "any modifier, any note": rides on every recorded pad hit
     pads: Mutex<Option<PadsState>>,
+    midi: Mutex<Option<MidiState>>,
+    keys_armed: Mutex<Mods>,     // armed mods for hits recorded from the keyboard
     _out: Out,
 }
 
@@ -161,6 +184,40 @@ fn start_pads(st: Arc<Studio>, port: String) -> Result<(), String> {
     Ok(())
 }
 
+// ---- midi thread ------------------------------------------------------------------------
+// Note-off is ignored on purpose: hits are one-shots, and sustain is a `decay_ms` mod armed
+// on the keys context. The polling thread owns the device; the studio holds only the state.
+fn start_midi(st: Arc<Studio>, id: u32) -> Result<String, String> {
+    let mut dev = Midi::open(id)?;
+    let name = dev.name.clone();
+    *st.midi.lock().unwrap() = Some(MidiState { id, name: name.clone(), mode: KeysMode::Drums, track: 0 });
+    std::thread::spawn(move || {
+        loop {
+            for e in dev.poll() {
+                if !e.on { continue; }
+                // Snapshot the context under a brief lock, then do the work unlocked.
+                let state = match st.midi.lock().unwrap().clone() { Some(s) => s, None => return };
+                let armed = st.keys_armed.lock().unwrap().clone();
+                let hit = match state.mode {
+                    KeysMode::Drums => {
+                        let slot = st.song.lock().unwrap().tracks.get(state.track).and_then(|t| t.slot_for_note(e.note));
+                        match slot { Some(s) => Hit { slot: s, vel: e.vel.clamp(1, 127), mods: armed }, None => continue }
+                    }
+                    KeysMode::Chromatic { slot, root } => {
+                        // The note's pitch wins over an armed pitch; everything else armed rides along.
+                        let pitch = 2f32.powf((e.note as f32 - root as f32) / 12.0);
+                        let mods = armed.over(&Mods { pitch: Some(pitch), ..Default::default() });
+                        Hit { slot, vel: e.vel.clamp(1, 127), mods }
+                    }
+                };
+                record_hit(&st, state.track, hit);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    });
+    Ok(name)
+}
+
 // ---- tools ------------------------------------------------------------------------------
 fn tools() -> Value {
     let mods_schema = json!({"type":"object","description":"per-hit overrides; omit a key to keep the voice default",
@@ -214,7 +271,13 @@ fn tools() -> Value {
         t("pads_context", "Which track the pads play into (its pad map picks the sounds).", json!({"track":{"type":"integer"}}), vec!["track"]),
         t("record", "Recording on/off: while playing, pad hits are quantised into the context track with the armed mods.",
           json!({"on":{"type":"boolean"}}), vec!["on"]),
-        t("arm", "Arm mods for every hit recorded from now on (any modifier, any note). Empty object disarms.", json!({"mods":mods_schema}), vec!["mods"]),
+        t("arm", "Arm mods for every hit recorded from now on (any modifier, any note). Empty object disarms. target picks the pads (default) or the keys context.",
+          json!({"mods":mods_schema,"target":{"type":"string","enum":["pads","keys"]}}), vec!["mods"]),
+        t("midi_list", "MIDI input devices as id + name (the Casio over USB shows up here).", json!({}), vec![]),
+        t("midi_open", "Open a MIDI input (default id 0) and start play-through. Keys get their own context: see midi_context.",
+          json!({"id":{"type":"integer"}}), vec![]),
+        t("midi_context", "Where the keyboard plays and how. drums: notes map to kit slots through the track's key map (GM layout by default: 36 kick, 38 snare, 42 hat, 49 crash...). chromatic: every key plays one slot pitched by note, root = the note that plays it unpitched (default 36). Note-off is ignored: sustain is arm {decay_ms} with target keys.",
+          json!({"track":{"type":"integer"},"mode":{"type":"string","enum":["drums","chromatic"]},"slot":{"type":"integer"},"root":{"type":"integer"}}), vec!["track","mode"]),
     ])
 }
 
@@ -246,6 +309,12 @@ fn call(st: &Arc<Studio>, name: &str, a: &Value) -> Result<Value, String> {
                 "recording": st.recording.load(Ordering::Relaxed),
                 "armed": *st.armed.lock().unwrap(),
                 "pads": pads.as_ref().map(|p| json!({"names": p.names, "learned": p.learned})),
+                "midi": st.midi.lock().unwrap().as_ref().map(|m| json!({
+                    "id": m.id, "name": m.name, "track": m.track,
+                    "mode": match m.mode { KeysMode::Drums => "drums", KeysMode::Chromatic{..} => "chromatic" },
+                    "slot": match m.mode { KeysMode::Chromatic{slot,..} => Some(slot), _ => None },
+                    "root": match m.mode { KeysMode::Chromatic{root,..} => Some(root), _ => None }})),
+                "keys_armed": *st.keys_armed.lock().unwrap(),
             }))
         }
         "song_get" => Ok(serde_json::to_value(&*st.song.lock().unwrap()).unwrap()),
@@ -415,8 +484,37 @@ fn call(st: &Arc<Studio>, name: &str, a: &Value) -> Result<Value, String> {
         }
         "arm" => {
             let m: Mods = serde_json::from_value(arg(a, "mods").cloned().ok_or("missing 'mods'")?).map_err(|e| e.to_string())?;
-            *st.armed.lock().unwrap() = m.clone();
-            Ok(json!({"ok": "armed", "mods": m}))
+            let target = arg(a, "target").and_then(Value::as_str).unwrap_or("pads");
+            match target {
+                "pads" => *st.armed.lock().unwrap() = m.clone(),
+                "keys" => *st.keys_armed.lock().unwrap() = m.clone(),
+                other => return Err(format!("bad target '{other}': pads|keys")),
+            }
+            Ok(json!({"ok": "armed", "target": target, "mods": m}))
+        }
+        "midi_list" => Ok(json!({"devices": Midi::list().into_iter().map(|(id, name)| json!({"id": id, "name": name})).collect::<Vec<_>>()})),
+        "midi_open" => {
+            let id = arg(a, "id").and_then(Value::as_u64).unwrap_or(0) as u32;
+            if st.midi.lock().unwrap().is_some() { return Err("midi already open".into()); }
+            let name = start_midi(st.clone(), id)?;
+            ok(format!("midi open: {id} {name}; drums mode into track 0 — set midi_context"))
+        }
+        "midi_context" => {
+            let track = usize_arg(a, "track")?;
+            let n = st.song.lock().unwrap().tracks.len();
+            if track >= n { return Err(format!("no track {track}")); }
+            let mode = match arg(a, "mode").and_then(Value::as_str).ok_or("missing 'mode'")? {
+                "drums" => KeysMode::Drums,
+                "chromatic" => KeysMode::Chromatic {
+                    slot: arg(a, "slot").and_then(Value::as_u64).unwrap_or(0) as usize,
+                    root: arg(a, "root").and_then(Value::as_u64).unwrap_or(36) as u8,
+                },
+                other => return Err(format!("bad mode '{other}': drums|chromatic")),
+            };
+            let mut g = st.midi.lock().unwrap();
+            let s = g.as_mut().ok_or("midi not open")?;
+            s.track = track; s.mode = mode.clone();
+            ok(format!("keys -> track {track}, {mode:?}"))
         }
         other => Err(format!("unknown tool {other}")),
     }
@@ -510,7 +608,8 @@ pub fn serve(kit_path: &str, pads_port: Option<&str>, door_port: Option<u16>) ->
         kit: RwLock::new(kit), kit_path: Mutex::new(kit_path.into()), song: Mutex::new(song),
         to_audio: Mutex::new(to_audio), playing, step, phase_milli: phase,
         context: AtomicU32::new(0), recording: AtomicBool::new(false),
-        armed: Mutex::new(Mods::default()), pads: Mutex::new(None), _out: out,
+        armed: Mutex::new(Mods::default()), pads: Mutex::new(None),
+        midi: Mutex::new(None), keys_armed: Mutex::new(Mods::default()), _out: out,
     });
     if let Some(p) = pads_port { if let Err(e) = start_pads(st.clone(), p.into()) { eprintln!("pads: {e} (use pads_open later)"); } }
     if let Some(p) = door_port { serve_tcp(st.clone(), p)?; }

@@ -10,6 +10,7 @@ mod audio;
 mod kit;
 mod live;
 mod mcp;
+mod midi;
 mod pads;
 mod seq;
 mod song;
@@ -30,6 +31,8 @@ fn main() {
             .and_then(|p| mcp::serve(&p.display().to_string(),
                                      a.get(3).map(String::as_str),
                                      a.get(4).and_then(|s| s.parse().ok()))),
+        // Diagnostic: list MIDI inputs, then open one and print what it sends.
+        Some("midi") => midi_diag(a.get(2).and_then(|s| s.parse().ok())),
         // Diagnostic: push a known-good file straight through the output layer, bypassing
         // the pads and the live mixer. If THIS crackles, audio.rs is at fault; if it is
         // clean, the fault is upstream in how live mixes.
@@ -61,7 +64,8 @@ fn main() {
             "                  pads   [port] [baud]\n",
             "                  live   <kit> [port] [map] [gain]   map e.g. 0,3,1,8 = pad→slot; gain default 2.0\n",
             "                  mcp    [kit] [pads-port] [door-port]   MCP server on stdio (kit default kits/bigbeat.kit)\n",
-            "                  play   <wav> | tone [hz]          output-layer diagnostics",
+            "                  play   <wav> | tone [hz]          output-layer diagnostics\n",
+            "                  midi   [id]                        list MIDI inputs; open one and print notes",
         ).into()),
     };
     if let Err(e) = r { eprintln!("toasteddrums: {e}"); std::process::exit(1); }
@@ -81,6 +85,25 @@ fn go_live(kit_path: &str, port: &str, map_arg: Option<&str>, master: f32) -> Re
         None => live::DEFAULT_MAP.to_vec(),
     };
     live::run(k, port, 115200, map, master)
+}
+
+/// Lists MIDI inputs; with an id (default 0 when any exist) opens it and prints every note
+/// for 30 s. The manual check for the Casio: play a key, see `on ch0 note 60 vel 87`.
+fn midi_diag(id: Option<u32>) -> Result<(), String> {
+    let devs = midi::Midi::list();
+    if devs.is_empty() { return Err("no MIDI input devices".into()); }
+    for (i, n) in &devs { eprintln!("{i}: {n}"); }
+    let id = id.unwrap_or(devs[0].0);
+    let mut m = midi::Midi::open(id)?;
+    eprintln!("opened {id} ({}) — play something; 30 s", m.name);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < end {
+        for e in m.poll() {
+            println!("{} ch{} note {:>3} vel {:>3}", if e.on { "on " } else { "off" }, e.channel, e.note, e.vel);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    Ok(())
 }
 
 /// Plays a WAV through audio.rs and nothing else. No pads, no mixer, no threads: if this

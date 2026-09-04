@@ -119,15 +119,18 @@ track is the context) and a MIDI key map.
 
 Tools: `status song_get song_set song_save song_load track_add track_set track_clear hit_set
 hit_add fill mods_apply play stop bpm master trigger kit_load kit_info render pads_open
-pads_learn pads_context record arm`. `tools/list` carries the schemas. Verified over stdio:
+pads_learn pads_context record arm midi_list midi_open midi_context`. `tools/list` carries the schemas. Verified over stdio:
 12/12 replies, nothing but protocol on stdout, `bpm` changes mid-play without a glitch.
 
 The pads session (`hello`/`go`/`cal`) and the three-tap learn live once, in `src/pads.rs`
 (`session_start`, `calibrate`, `Learn`), and `live` and `mcp` both use them.
 
 ## Next
-1. MIDI input from the Casio over USB (winmm, zero crates): drum mode (notes -> slots) and
-   chromatic mode (one slot pitched by note) with its own recording context.
+1. Verify MIDI on the Casio. `src/midi.rs` (winmm, zero crates) is built and unit-tested --
+   drum mode maps notes to slots through the track key map, chromatic mode pitches one slot
+   by note, and the keys have their own context and armed mods -- but it has never met the
+   keyboard, which does not fit in the shed. Check: `toasteddrums midi`, then `midi_open`
+   and `midi_context` over MCP.
 2. The operator UI on the TCP door: eframe/egui, pinned and vetted like every other crate.
 3. Paint panel 1 over COM9 at hit time (the `vis.rs` frames already exist).
 4. Lower latency still: cpal WASAPI **exclusive** mode gets under the 10 ms shared-mode period.
