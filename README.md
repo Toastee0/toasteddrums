@@ -91,9 +91,18 @@ and the mixer pitch-corrects the 44.1 kHz kit with a fractional cursor — askin
 the kit's rate is what made everything play flat and slow. Vetted before adding: RustAudio
 repo, every dependency from the crates.io registry, no git/path sources.
 
+### Calibration is per session, per striker
+`live` never carries thresholds between runs. On start it measures the untouched noise floor
+(1 s), then asks for **three taps per pad** and derives that pad's `thresh` (half a typical
+hit, never inside the noise floor) and `gain` (1.6× a typical hit, so normal playing lands
+near vel 80). Tap the foot pads with your feet and the hand pads with your hands or sticks:
+the kit learns *that* strike on *that* mounting, and a hand on a foot-tuned pad will
+overdrive it — which is the sign it's measuring something real. A pad left untapped keeps
+its learn threshold and reports uncalibrated velocity rather than inventing a gain.
+
 ## Next
-1. Play `live` and tune by ear: `set gain <pad> <n>` and `set thresh <pad> <n>` over serial,
-   then `save`. Everything is live except `dur`.
+1. Learn-phase UX: a way to redo one pad mid-session without restarting, and a keypress to
+   skip the taps when you just want the last numbers back.
 2. Paint panel 1 over COM9 at hit time (the `vis.rs` frames already exist).
 3. Port ownership: COM9 is held by `annunciator.exe` — decide whether ToastedDrums is a mode of
    annunciator-rs or annunciator.exe exposes a local pipe (see `~/HANDOFF_HISTORY/ANNUNCIATOR_CLIENT_HANDOFF.md`).
