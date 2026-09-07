@@ -55,10 +55,13 @@ struct PadsState {
     learned: Vec<Option<(f32, f32)>>,   // (thresh, gain) per pad once a learn completes
 }
 
-struct Studio {
+pub struct Studio {
     kit: RwLock<Arc<Kit>>,
     kit_path: Mutex<String>,
     song: Mutex<Song>,
+    /// Bumped on every song edit so a poller (the UI) can fetch `song_get` only on change.
+    version: AtomicU64,
+    master: Mutex<f32>,
     to_audio: Mutex<Sender<Cmd>>,
     /// Written by the audio callback every buffer; read by whoever quantises.
     playing: Arc<AtomicBool>,
@@ -80,6 +83,7 @@ impl Studio {
     }
     fn push_song(&self) -> Result<(), String> {
         let s = self.song.lock().unwrap().clone();
+        self.version.fetch_add(1, Ordering::Relaxed);
         self.send(Cmd::SetSong(s))
     }
 }
@@ -248,6 +252,7 @@ fn tools() -> Value {
           json!({"track":{"type":"integer"},"name":{"type":"string"},"len":{"type":"integer"},"pads":{"type":"array","items":{"type":"integer"}},
                  "keys":{"type":"object","additionalProperties":{"type":"integer"}},"mute":{"type":"boolean"}}), vec!["track"]),
         t("track_clear", "Remove every hit from a track.", json!({"track":{"type":"integer"}}), vec!["track"]),
+        t("track_remove", "Delete a track. The last track cannot be removed.", json!({"track":{"type":"integer"}}), vec!["track"]),
         t("hit_set", "Set the hits on one cell (replaces). Empty list clears it.",
           json!({"track":{"type":"integer"},"step":{"type":"integer"},"hits":{"type":"array","items":hit_schema}}), vec!["track","step","hits"]),
         t("hit_add", "Add one hit to a cell, replacing any hit already there on the same slot.",
@@ -263,6 +268,7 @@ fn tools() -> Value {
         t("trigger", "Play one hit right now, off the grid.", json!({"hit":hit_schema}), vec!["hit"]),
         t("kit_load", "Load a .kit file (path relative to the project).", json!({"path":{"type":"string"}}), vec!["path"]),
         t("kit_info", "Slots, labels and sample lengths of the loaded kit.", json!({}), vec![]),
+        t("kit_list", "The .kit files beside the loaded kit, as paths kit_load accepts.", json!({}), vec![]),
         t("render", "Render the song to a 16-bit WAV. steps defaults to one full polymeter cycle.",
           json!({"path":{"type":"string"},"steps":{"type":"integer"}}), vec!["path"]),
         t("pads_open", "Open the pad controller (default COM5), calibrate the untouched baseline, start play-through. Hands off the pads for 3 s.",
@@ -299,6 +305,9 @@ fn call(st: &Arc<Studio>, name: &str, a: &Value) -> Result<Value, String> {
             Ok(json!({
                 "playing": st.playing.load(Ordering::Relaxed),
                 "step": st.step.load(Ordering::Relaxed),
+                "phase": st.phase_milli.load(Ordering::Relaxed) as f32 / 1000.0,
+                "version": st.version.load(Ordering::Relaxed),
+                "master": *st.master.lock().unwrap(),
                 "bpm": s.bpm,
                 "kit": *st.kit_path.lock().unwrap(),
                 "tracks": s.tracks.iter().enumerate().map(|(i,t)| json!({
@@ -369,6 +378,18 @@ fn call(st: &Arc<Studio>, name: &str, a: &Value) -> Result<Value, String> {
               for c in &mut t.cells { c.clear(); } }
             st.push_song()?; ok(format!("track {i} cleared"))
         }
+        "track_remove" => {
+            let i = usize_arg(a, "track")?;
+            { let mut s = st.song.lock().unwrap();
+              if i >= s.tracks.len() { return Err(format!("no track {i}")); }
+              if s.tracks.len() == 1 { return Err("cannot remove the last track".into()); }
+              s.tracks.remove(i); }
+            // Contexts that pointed past the end now point at the last track.
+            let last = (st.song.lock().unwrap().tracks.len() - 1) as u32;
+            let _ = st.context.fetch_min(last, Ordering::Relaxed);
+            if let Some(m) = st.midi.lock().unwrap().as_mut() { m.track = m.track.min(last as usize); }
+            st.push_song()?; ok(format!("track {i} removed"))
+        }
         "hit_set" | "hit_add" => {
             let i = usize_arg(a, "track")?; let step = usize_arg(a, "step")?;
             { let mut s = st.song.lock().unwrap();
@@ -426,8 +447,10 @@ fn call(st: &Arc<Studio>, name: &str, a: &Value) -> Result<Value, String> {
             st.push_song()?; ok(format!("bpm {b}"))
         }
         "master" => {
-            let g = arg(a, "gain").and_then(Value::as_f64).ok_or("missing 'gain'")? as f32;
-            st.send(Cmd::Master(g))?; ok(format!("master {g}"))
+            let g = (arg(a, "gain").and_then(Value::as_f64).ok_or("missing 'gain'")? as f32).max(0.0);
+            st.send(Cmd::Master(g))?;
+            *st.master.lock().unwrap() = g;
+            ok(format!("master {g}"))
         }
         "trigger" => {
             let h: Hit = serde_json::from_value(arg(a, "hit").cloned().ok_or("missing 'hit'")?).map_err(|e| e.to_string())?;
@@ -448,7 +471,18 @@ fn call(st: &Arc<Studio>, name: &str, a: &Value) -> Result<Value, String> {
             Ok(json!({"name": k.name, "rate": k.rate,
                 "slots": k.voices.iter().enumerate().map(|(i,v)| json!({"slot": i,
                     "label": v.as_ref().map(|v| v.label.clone()),
+                    "color": v.as_ref().map(|v| v.color),
                     "ms": v.as_ref().map(|v| v.mono.len() as f32 * 1000.0 / k.rate as f32)})).collect::<Vec<_>>()}))
+        }
+        "kit_list" => {
+            let cur = st.kit_path.lock().unwrap().clone();
+            let dir = Path::new(&cur).parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
+            let mut kits: Vec<String> = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?
+                .filter_map(|e| e.ok()).map(|e| e.path())
+                .filter(|p| p.extension().map_or(false, |x| x == "kit"))
+                .map(|p| p.display().to_string().replace('\\', "/")).collect();
+            kits.sort();
+            Ok(json!({"kits": kits, "current": cur}))
         }
         "render" => {
             let p = arg(a, "path").and_then(Value::as_str).ok_or("missing 'path'")?;
@@ -582,7 +616,7 @@ fn serve_lines(st: &Arc<Studio>, r: impl BufRead, mut w: impl Write) {
 }
 
 /// The UI door: same verbs, same dispatch, over localhost. One thread per connection.
-fn serve_tcp(st: Arc<Studio>, port: u16) -> Result<(), String> {
+pub fn serve_tcp(st: Arc<Studio>, port: u16) -> Result<(), String> {
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| format!("tcp {port}: {e}"))?;
     eprintln!("toasteddrums mcp: ui door on 127.0.0.1:{port}");
     std::thread::spawn(move || {
@@ -596,7 +630,9 @@ fn serve_tcp(st: Arc<Studio>, port: u16) -> Result<(), String> {
     Ok(())
 }
 
-pub fn serve(kit_path: &str, pads_port: Option<&str>, door_port: Option<u16>) -> Result<(), String> {
+/// Loads the kit, opens the audio device and (optionally) the pads: the engine, with no
+/// door attached yet. `serve` adds stdio and TCP; the UI in standalone mode adds TCP only.
+pub fn open_studio(kit_path: &str, pads_port: Option<&str>) -> Result<Arc<Studio>, String> {
     let kit = Arc::new(Kit::load(Path::new(kit_path))?);
     let song = Song::empty(120.0);
     let playing = Arc::new(AtomicBool::new(false));
@@ -606,13 +642,21 @@ pub fn serve(kit_path: &str, pads_port: Option<&str>, door_port: Option<u16>) ->
 
     let st = Arc::new(Studio {
         kit: RwLock::new(kit), kit_path: Mutex::new(kit_path.into()), song: Mutex::new(song),
+        version: AtomicU64::new(1), master: Mutex::new(2.0),
         to_audio: Mutex::new(to_audio), playing, step, phase_milli: phase,
         context: AtomicU32::new(0), recording: AtomicBool::new(false),
         armed: Mutex::new(Mods::default()), pads: Mutex::new(None),
         midi: Mutex::new(None), keys_armed: Mutex::new(Mods::default()), _out: out,
     });
     if let Some(p) = pads_port { if let Err(e) = start_pads(st.clone(), p.into()) { eprintln!("pads: {e} (use pads_open later)"); } }
-    if let Some(p) = door_port { serve_tcp(st.clone(), p)?; }
+    Ok(st)
+}
+
+pub fn serve(kit_path: &str, pads_port: Option<&str>, door_port: Option<u16>) -> Result<(), String> {
+    let st = open_studio(kit_path, pads_port)?;
+    // A taken port (a standalone `ui` already there, say) costs the door, not the server:
+    // stdio is the reason this process exists.
+    if let Some(p) = door_port { if let Err(e) = serve_tcp(st.clone(), p) { eprintln!("door: {e}; stdio only"); } }
     eprintln!("toasteddrums mcp: kit {kit_path}, stdio ready");
 
     let stdin = std::io::stdin();

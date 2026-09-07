@@ -125,12 +125,54 @@ pads_learn pads_context record arm midi_list midi_open midi_context`. `tools/lis
 The pads session (`hello`/`go`/`cal`) and the three-tap learn live once, in `src/pads.rs`
 (`session_start`, `calibrate`, `Learn`), and `live` and `mcp` both use them.
 
+## The operator UI: a tracker inside an 808
+
+```
+toasteddrums ui                    # attaches to mcp's door on 127.0.0.1:4242, or runs the engine itself
+toasteddrums ui 4242 kits/mt240.kit COM5   # port / kit / pads, any order
+```
+
+`src/ui.rs` is eframe/egui (**pinned `=0.36.1`, default features off + `glow` +
+`default_fonts`**; 0.36's default backend is wgpu, which is a far larger tree). Vetted the
+same way as cpal: emilk/egui, every one of the 133 packages that build on windows-gnu comes
+from the crates.io registry, no git or path sources.
+
+The UI is a **client of the door**. It never holds the song: it speaks the same JSON-RPC
+verbs Claude does, over TCP, so the two of you edit ONE song. With nothing listening on the
+port it starts the engine in-process and connects to that -- same code path, no Claude
+required. `.mcp.json` passes `4242` so Claude's server always opens the door.
+
+Layout: rows are steps and columns the nine kit slots, tracker-style; a cell reads
+`VV FFFFFF` -- velocity in hex, then P D C R G L flags for pitch / drive / crush / reverse /
+gain / decay, so "any modifier, any note" is visible per cell. Around the grid, the 808:
+the instrument strip (tap buttons, TUNE / LEVEL / DECAY per voice applied to every hit of
+that voice in the pattern), the sixteen step buttons in red / orange / yellow / white with
+the running light for the selected voice, START / STOP, TEMPO, MASTER, REC and ACCENT.
+Patterns on the left are the tracks: each has its own length, so 4/4 against 3/4 is two
+patterns. The right panel edits the hit under the cursor, the armed mods for the pads and
+the keys, opens the pads (with LEARN) and the MIDI keyboard.
+
+Keys, when no text field has focus:
+```
+arrows / PgUp PgDn / Home End   cursor        Tab, Shift+Tab   next / prev pattern
+1-9   write a hit at that ninth (9 = accent)  0 Del Backspace  clear the cell
+Enter toggle a hit (x, or X with ACCENT lit)  a                accent on / off
+r     reverse on / off                        - =              pitch down / up a semitone
+z x c v b n m , .   tap slots 0-8 -- records while REC and playing, like TAP WRITE
+Space START / STOP
+```
+
+Measured on phobos (1536×864 logical at 125 %): the window opens maximised and everything
+fits without the grid scrolling sideways. Edits round-trip through the door in well under a
+frame; the UI applies each edit to its own snapshot at once and a poll that raced with a
+queued edit is dropped, so nothing flickers.
+
 ## Next
 1. Verify MIDI on the Casio. `src/midi.rs` (winmm, zero crates) is built and unit-tested --
    drum mode maps notes to slots through the track key map, chromatic mode pitches one slot
    by note, and the keys have their own context and armed mods -- but it has never met the
    keyboard, which does not fit in the shed. Check: `toasteddrums midi`, then `midi_open`
-   and `midi_context` over MCP.
-2. The operator UI on the TCP door: eframe/egui, pinned and vetted like every other crate.
+   and `midi_context` over MCP, or the KEYS panel in the UI.
+2. Play the UI with the pads on the bench: open COM5 from the PADS panel, learn, REC, tap.
 3. Paint panel 1 over COM9 at hit time (the `vis.rs` frames already exist).
 4. Lower latency still: cpal WASAPI **exclusive** mode gets under the 10 ms shared-mode period.

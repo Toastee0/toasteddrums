@@ -12,6 +12,9 @@ path = "src/main.rs"
 cpal = "=0.18.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
+# The operator UI. Vetted like cpal: emilk/egui, pinned, registry-only tree. Default
+# features off because 0.36 defaults to wgpu (a huge tree); glow is a single GL context.
+eframe = { version = "=0.36.1", default-features = false, features = ["glow", "default_fonts"] }
 
 [profile.release]
 opt-level = 2

@@ -14,6 +14,7 @@ mod midi;
 mod pads;
 mod seq;
 mod song;
+mod ui;
 mod vis;
 mod wav;
 
@@ -24,13 +25,20 @@ fn main() {
     let r = match a.get(1).map(String::as_str) {
         Some("render") if a.len() >= 5 => render(&a[2], &a[3], &a[4], a.get(5).and_then(|b| b.parse().ok()).unwrap_or(2)),
         Some("show") if a.len() >= 4 => show(&a[2], &a[3]),
-        // The tracker as an MCP server over stdio: `mcp [kit] [pads-port] [door-port]`.
-        // Nothing but protocol may go to stdout in this mode. This arm yields a Result like
-        // every other -- `?` cannot be used in `fn main`, which returns ().
-        Some("mcp") => find_data(a.get(2).map(String::as_str).unwrap_or("kits/bigbeat.kit"))
-            .and_then(|p| mcp::serve(&p.display().to_string(),
-                                     a.get(3).map(String::as_str),
-                                     a.get(4).and_then(|s| s.parse().ok()))),
+        // The tracker as an MCP server over stdio: `mcp [kit] [COMn] [door-port]`, the last
+        // two in either order. Nothing but protocol may go to stdout in this mode. This arm
+        // yields a Result like every other -- `?` cannot be used in `fn main`, which returns ().
+        Some("mcp") => {
+            let (kit, pads, door) = engine_args(&a[2..]);
+            find_data(kit).and_then(|p| mcp::serve(&p.display().to_string(), pads, door))
+        }
+        // The operator UI: `ui [door-port] [kit] [COMn]`. Attaches to a running `mcp`'s
+        // door; if nothing is listening it runs the engine itself, so the machine works
+        // with no Claude at all. Either way there is one engine and one song.
+        Some("ui") => {
+            let (kit, pads, door) = engine_args(&a[2..]);
+            find_data(kit).and_then(|p| ui::run(door.unwrap_or(ui::DEFAULT_DOOR), &p.display().to_string(), pads))
+        }
         // Diagnostic: list MIDI inputs, then open one and print what it sends.
         Some("midi") => midi_diag(a.get(2).and_then(|s| s.parse().ok())),
         // Diagnostic: push a known-good file straight through the output layer, bypassing
@@ -63,12 +71,27 @@ fn main() {
             "                  show   <kit> <pattern>\n",
             "                  pads   [port] [baud]\n",
             "                  live   <kit> [port] [map] [gain]   map e.g. 0,3,1,8 = pad→slot; gain default 2.0\n",
-            "                  mcp    [kit] [pads-port] [door-port]   MCP server on stdio (kit default kits/bigbeat.kit)\n",
+            "                  mcp    [kit] [COMn] [door-port]     MCP server on stdio (kit default kits/bigbeat.kit)\n",
+            "                  ui     [door-port] [kit] [COMn]     tracker UI; attaches to mcp's door or runs the engine itself\n",
             "                  play   <wav> | tone [hz]          output-layer diagnostics\n",
             "                  midi   [id]                        list MIDI inputs; open one and print notes",
         ).into()),
     };
     if let Err(e) = r { eprintln!("toasteddrums: {e}"); std::process::exit(1); }
+}
+
+/// Engine arguments by shape rather than position: `COMn` is the pads port, a number is
+/// the door port, anything else is the kit. So `mcp COM5 4242`, `ui 4242`, `ui kits/x.kit
+/// COM5` all read the obvious way.
+fn engine_args(rest: &[String]) -> (&str, Option<&str>, Option<u16>) {
+    let mut kit = "kits/bigbeat.kit";
+    let (mut pads, mut door) = (None, None);
+    for s in rest {
+        if s.len() >= 4 && s[..3].eq_ignore_ascii_case("com") { pads = Some(s.as_str()); }
+        else if let Ok(p) = s.parse::<u16>() { door = Some(p); }
+        else { kit = s.as_str(); }
+    }
+    (kit, pads, door)
 }
 
 fn go_live(kit_path: &str, port: &str, map_arg: Option<&str>, master: f32) -> Result<(), String> {
