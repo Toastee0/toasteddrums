@@ -58,6 +58,26 @@ impl Wav {
     }
 
     /// Serialize as 16-bit PCM.
+    /// 32-bit float PCM (format 3): exact, for bakes the game must reproduce bit for bit.
+    pub fn to_bytes_f32(&self) -> Vec<u8> {
+        let n = self.data.len() * 4;
+        let mut o = Vec::with_capacity(44 + n);
+        o.extend_from_slice(b"RIFF");
+        o.extend_from_slice(&((36 + n) as u32).to_le_bytes());
+        o.extend_from_slice(b"WAVEfmt ");
+        o.extend_from_slice(&16u32.to_le_bytes());
+        o.extend_from_slice(&3u16.to_le_bytes());
+        o.extend_from_slice(&self.channels.to_le_bytes());
+        o.extend_from_slice(&self.rate.to_le_bytes());
+        o.extend_from_slice(&(self.rate * self.channels as u32 * 4).to_le_bytes());
+        o.extend_from_slice(&(self.channels * 4).to_le_bytes());
+        o.extend_from_slice(&32u16.to_le_bytes());
+        o.extend_from_slice(b"data");
+        o.extend_from_slice(&(n as u32).to_le_bytes());
+        for &s in &self.data { o.extend_from_slice(&s.to_le_bytes()); }
+        o
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let n = self.data.len() * 2;
         let mut o = Vec::with_capacity(44 + n);

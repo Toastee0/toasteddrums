@@ -472,7 +472,7 @@ impl App {
                 let _ = resp;
                 // ◄ marks the pads context; M a muted track
                 let label = format!("{i}{} {:<7} {:>2}/{:<3}{hits:>3}h{}", if snap.st.context == i { "◄" } else { " " },
-                                    t.name.chars().take(7).collect::<String>(), pos, t.len, if t.mute { " M" } else { "" });
+                                    t.name.chars().take(7).collect::<String>(), pos, t.len, if t.mute { " M" } else { "" }) + &(if t.intensity > 0 { format!(" i{}", t.intensity) } else { String::new() });
                 if ui.selectable_label(sel, RichText::new(label).monospace()).clicked() { self.track = i; }
             });
         }
@@ -502,6 +502,11 @@ impl App {
             ui.horizontal(|ui| {
                 let mut mute = t.mute;
                 if ui.checkbox(&mut mute, "mute").changed() { self.edit_track(i, |tr| tr.mute = mute, json!({"mute": mute})); }
+                let mut inten = t.intensity as i32;
+                ui.label("layer");
+                if ui.add(egui::DragValue::new(&mut inten).range(0..=3)).on_hover_text("0 always plays; 1-3 come in as the game's danger rises").changed() {
+                    self.edit_track(i, |tr| tr.intensity = inten as u8, json!({"intensity": inten}));
+                }
                 if ui.small_button("pads here").on_hover_text("the plates play and record into this track").clicked() {
                     self.send("pads_context", json!({"track": i}));
                 }

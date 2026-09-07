@@ -26,6 +26,7 @@
 
 use crate::wav::Wav;
 use std::path::Path;
+use crate::wub::{self, WubParams};
 
 /// Parsed `key=value` / flag mutations from the end of a voice line.
 #[derive(Default)]
@@ -40,6 +41,15 @@ struct Muts {
     sweep: Option<f32>,
     decay: Option<f32>,
     click: Option<f32>,
+    /// wub parameters
+    wave: Option<u8>,
+    detune: Option<f32>,
+    sub: Option<f32>,
+    cutoff: Option<f32>,
+    floor: Option<f32>,
+    res: Option<f32>,
+    wob: Option<f32>,
+    hold: Option<f32>,
 }
 
 /// Peels mutation tokens off the right of `rest` until one is not a mutation; what is
@@ -63,6 +73,14 @@ fn split_mutations(rest: &str) -> (&str, Muts) {
                     "sweep" => { m.sweep = f; true }
                     "decay" => { m.decay = f; true }
                     "click" => { m.click = f; true }
+                    "wave"  => { m.wave = match v { "saw" => Some(0), "square" => Some(1), _ => None }; true }
+                    "detune" => { m.detune = f; true }
+                    "sub"   => { m.sub = f; true }
+                    "cutoff" => { m.cutoff = f; true }
+                    "floor" => { m.floor = f; true }
+                    "res"   => { m.res = f; true }
+                    "wob"   => { m.wob = f; true }
+                    "hold"  => { m.hold = f; true }
                     _ => false,
                 }
             }
@@ -142,7 +160,10 @@ fn synth_kick(rate: u32, f0: f32, sweep: f32, decay_ms: f32, click: f32) -> Vec<
 pub struct Voice {
     pub label: String,
     pub color: [u8; 3],
+    /// the sample (for a wub: a preview render, used only by the sample-only mixers)
     pub mono: Vec<f32>,
+    /// Some for a synth:wub voice: the Transport synthesises it per hit instead of reading `mono`
+    pub wub: Option<WubParams>,
 }
 
 #[derive(Debug)]
@@ -185,6 +206,31 @@ impl Kit {
                     let (source, muts) = split_mutations(s.trim());
                     if source.is_empty() { return Err(format!("line {}: missing source", ln + 1)); }
 
+                    // A wub is not a sample: keep its parameters and synthesise per hit.
+                    // Kit-level pitch/drive/crush/gain fold into the parameters; `mono`
+                    // gets a preview render for the mixers that only read samples.
+                    if source == "synth:wub" {
+                        if kit.rate == 0 { kit.rate = 44100; }
+                        let d = WubParams::default();
+                        let p = WubParams {
+                            f0: m_or(muts.f0, d.f0) * m_or(muts.pitch, 1.0),
+                            wave: muts.wave.unwrap_or(d.wave),
+                            detune_cents: m_or(muts.detune, d.detune_cents),
+                            sub: m_or(muts.sub, d.sub),
+                            cutoff: m_or(muts.cutoff, d.cutoff),
+                            floor: m_or(muts.floor, d.floor),
+                            res: m_or(muts.res, d.res),
+                            wob: m_or(muts.wob, d.wob),
+                            hold_ms: m_or(muts.hold, d.hold_ms),
+                            decay_ms: m_or(muts.decay, d.decay_ms),
+                            drive: if muts.drive.is_some() { muts.drive } else { d.drive },
+                            crush: muts.crush,
+                            gain: m_or(muts.gain, 1.0),
+                        };
+                        let mono = wub::preview(&p, kit.rate);
+                        kit.voices[slot] = Some(Voice { label, color, mono, wub: Some(p) });
+                        continue;
+                    }
                     let mut mono = if let Some(kind) = source.strip_prefix("synth:") {
                         // A synth voice may precede any sample; it needs a rate before one
                         // has been seen, so default to CD rate and let a later sample
@@ -199,7 +245,7 @@ impl Kit {
                         w.mono()
                     };
                     mutate(&mut mono, &muts);
-                    kit.voices[slot] = Some(Voice { label, color, mono });
+                    kit.voices[slot] = Some(Voice { label, color, mono, wub: None });
                 }
                 _ => return Err(format!("line {}: unknown key {key}", ln + 1)),
             }
@@ -208,6 +254,8 @@ impl Kit {
         Ok(kit)
     }
 }
+
+fn m_or(v: Option<f32>, d: f32) -> f32 { v.unwrap_or(d) }
 
 fn parse_rgb(s: &str) -> Result<[u8; 3], String> {
     let v: Vec<u8> = s.split(',').map(|x| x.trim().parse().map_err(|_| format!("bad colour {s}"))).collect::<Result<_, _>>()?;

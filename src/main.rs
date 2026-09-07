@@ -3,6 +3,7 @@
 //!
 //!   toasteddrums render <kit> <pattern> <out.wav> [bars]   offline mix → WAV (bench)
 //!   toasteddrums show   <kit> <pattern>                    print each step's 3×3 frame
+//!   toasteddrums bake   <kit> <song.json> <outdir>      export for a game: slot WAVs + song.txt + golden.wav
 //!   toasteddrums pads   [port] [baud]                      watch the pad controller
 //!   toasteddrums live   <kit> [port] [map]                 PLAY the kit from the pads
 
@@ -17,6 +18,7 @@ mod song;
 mod ui;
 mod vis;
 mod wav;
+mod wub;
 
 use std::path::Path;
 
@@ -25,6 +27,7 @@ fn main() {
     let r = match a.get(1).map(String::as_str) {
         Some("render") if a.len() >= 5 => render(&a[2], &a[3], &a[4], a.get(5).and_then(|b| b.parse().ok()).unwrap_or(2)),
         Some("show") if a.len() >= 4 => show(&a[2], &a[3]),
+        Some("bake") if a.len() >= 5 => bake(&a[2], &a[3], &a[4]),
         // The tracker as an MCP server over stdio: `mcp [kit] [COMn] [door-port]`, the last
         // two in either order. Nothing but protocol may go to stdout in this mode. This arm
         // yields a Result like every other -- `?` cannot be used in `fn main`, which returns ().
@@ -282,6 +285,78 @@ fn render(kit: &str, pat: &str, out: &str, bars: usize) -> Result<(), String> {
     std::fs::write(out, w.to_bytes()).map_err(|e| e.to_string())?;
     eprintln!("kit '{}' @ {} Hz, {} bpm, {bars} bars → {out} ({:.2} s, peak {peak:.2})",
         k.name, k.rate, e.pattern.bpm, w.frames() as f32 / k.rate as f32);
+    Ok(())
+}
+
+/// `bake <kit> <song.json> <outdir>`: everything a game needs to play the song with no kit
+/// loader, resampler or JSON parser of its own. Written to `outdir`:
+///   slotN.wav   each sample voice after its load-time mutations, 32-bit float mono at
+///               the kit rate (float so the game's mix can match ours bit for bit)
+///   song.txt    bpm, rate, master, voices (wubs as parameters, samples as file names),
+///               tracks with intensity, one `hit` line per hit with its mods
+///   song.json   the song as given, for loading back into the tracker
+///   golden.wav  one full polymeter cycle plus a second of tail, rendered by the
+///               Transport: the game's port is diffed against this
+fn bake(kit_path: &str, song_path: &str, outdir: &str) -> Result<(), String> {
+    use std::fmt::Write as _;
+    let kp = find_data(kit_path)?;
+    let k = std::sync::Arc::new(kit::Kit::load(&kp)?);
+    let sp = find_data(song_path)?;
+    let text = std::fs::read_to_string(&sp).map_err(|e| format!("{}: {e}", sp.display()))?;
+    let mut song: song::Song = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", sp.display()))?;
+    song.normalise();
+    let out = Path::new(outdir);
+    std::fs::create_dir_all(out).map_err(|e| format!("{outdir}: {e}"))?;
+
+    let mut s = String::new();
+    let _ = writeln!(s, "# baked by toasteddrums from {} + {}", kp.display(), sp.display());
+    let _ = writeln!(s, "bpm {}", song.bpm);
+    let _ = writeln!(s, "rate {}", k.rate);
+    let _ = writeln!(s, "master {}", song::DEFAULT_MASTER);
+    for (i, v) in k.voices.iter().enumerate() {
+        let Some(v) = v else { continue };
+        let name = v.label.replace(' ', "_");
+        if let Some(p) = &v.wub {
+            let _ = write!(s, "voice slot={i} name={name} wub f0={} wave={} detune={} sub={} cutoff={} floor={} res={} wob={} hold={} decay={} gain={}",
+                           p.f0, p.wave, p.detune_cents, p.sub, p.cutoff, p.floor, p.res, p.wob, p.hold_ms, p.decay_ms, p.gain);
+            if let Some(d) = p.drive { let _ = write!(s, " drive={d}"); }
+            if let Some(c) = p.crush { let _ = write!(s, " crush={c}"); }
+            let _ = writeln!(s);
+        } else {
+            let file = format!("slot{i}.wav");
+            let w = wav::Wav { rate: k.rate, channels: 1, data: v.mono.clone() };
+            std::fs::write(out.join(&file), w.to_bytes_f32()).map_err(|e| format!("{file}: {e}"))?;
+            let _ = writeln!(s, "voice slot={i} name={name} file={file}");
+        }
+    }
+    let mut nhits = 0;
+    for t in &song.tracks {
+        let _ = writeln!(s, "track name={} len={} intensity={}{}", t.name.replace(' ', "_"), t.len, t.intensity, if t.mute { " mute" } else { "" });
+        for (step, cell) in t.cells.iter().enumerate() {
+            for h in cell {
+                let _ = write!(s, "hit step={step} slot={} vel={}", h.slot, h.vel);
+                let m = &h.mods;
+                if let Some(v) = m.pitch { let _ = write!(s, " pitch={v}"); }
+                if let Some(v) = m.drive { let _ = write!(s, " drive={v}"); }
+                if let Some(v) = m.crush { let _ = write!(s, " crush={v}"); }
+                if m.rev == Some(true) { let _ = write!(s, " rev"); }
+                if let Some(v) = m.gain { let _ = write!(s, " gain={v}"); }
+                if let Some(v) = m.decay_ms { let _ = write!(s, " decay={v}"); }
+                let _ = writeln!(s);
+                nhits += 1;
+            }
+        }
+    }
+    std::fs::write(out.join("song.txt"), &s).map_err(|e| format!("song.txt: {e}"))?;
+    std::fs::write(out.join("song.json"), serde_json::to_string_pretty(&song).unwrap()).map_err(|e| format!("song.json: {e}"))?;
+
+    let steps = song.cycle_steps();
+    let data = song::Transport::render(k.clone(), song.clone(), steps);
+    let peak = data.iter().fold(0f32, |m, s| m.max(s.abs()));
+    let w = wav::Wav { rate: k.rate, channels: 1, data };
+    std::fs::write(out.join("golden.wav"), w.to_bytes_f32()).map_err(|e| format!("golden.wav: {e}"))?;
+    eprintln!("baked '{}' + {} tracks / {nhits} hits @ {} Hz {} bpm → {outdir} (golden {:.2} s, peak {peak:.2})",
+              k.name, song.tracks.len(), k.rate, song.bpm, w.frames() as f32 / k.rate as f32);
     Ok(())
 }
 

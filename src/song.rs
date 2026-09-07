@@ -19,6 +19,7 @@
 //! return these exact shapes.
 
 use crate::kit::Kit;
+use crate::wub::WubState;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -81,6 +82,10 @@ pub struct Track {
     pub cells: Vec<Vec<Hit>>,
     #[serde(default)]
     pub mute: bool,
+    /// Layer for a game or a live set: 0 always plays, 1..3 come in as the danger rises.
+    /// Purely a tag here; the game (or whoever drives mute) reads it.
+    #[serde(default)]
+    pub intensity: u8,
 }
 
 fn default_pads() -> [usize; 4] { [0, 3, 1, 8] }
@@ -89,7 +94,7 @@ impl Track {
     pub fn new(name: &str, len: usize) -> Track {
         let len = len.max(1);
         Track { name: name.into(), len, pads: default_pads(), keys: BTreeMap::new(),
-                cells: vec![Vec::new(); len], mute: false }
+                cells: vec![Vec::new(); len], mute: false, intensity: 0 }
     }
     /// Keep `cells` exactly `len` long after any edit, preserving what fits.
     pub fn normalise(&mut self) {
@@ -147,6 +152,8 @@ impl Song {
 
 /// A sounding hit with its mods resolved into per-instance state.
 struct Voice {
+    /// Some: a wub being synthesised; the sample fields below are then unused
+    wub: Option<WubState>,
     slot: usize,
     pos: f32,       // fractional source cursor
     step: f32,      // cursor advance per kit-rate sample (pitch)
@@ -168,6 +175,9 @@ pub enum Cmd {
     Master(f32),
 }
 
+/// Transport master gain before the soft knee. Baked into song.txt so the game matches.
+pub const DEFAULT_MASTER: f32 = 2.0;
+
 /// Owns the kit and the song inside the audio callback. Produces KIT-RATE audio.
 pub struct Transport {
     pub kit: Arc<Kit>,
@@ -184,7 +194,7 @@ pub struct Transport {
 impl Transport {
     pub fn new(kit: Arc<Kit>, song: Song) -> Transport {
         Transport { kit, song, playing: false, global_step: 0, pos_in_step: 0,
-                    voices: Vec::with_capacity(32), master: 2.0, glow: [0.0; 9] }
+                    voices: Vec::with_capacity(32), master: DEFAULT_MASTER, glow: [0.0; 9] }
     }
 
     pub fn apply(&mut self, c: Cmd) {
@@ -211,8 +221,17 @@ impl Transport {
         let len = v.mono.len() as f32;
         let rev = m.rev.unwrap_or(false);
         let sr = self.kit.rate as f32;
+        // A wub is synthesised: per-hit drive/crush override the kit's, pitch moves the
+        // note, decay_ms the release, velocity the gain (below). The wobble follows the bpm.
+        let wub = v.wub.as_ref().map(|p| {
+            let mut p = p.clone();
+            if m.drive.is_some() { p.drive = m.drive; }
+            if m.crush.is_some() { p.crush = m.crush; }
+            WubState::new(&p, self.kit.rate, m.pitch.filter(|p| *p > 0.0).unwrap_or(1.0), self.song.bpm, m.decay_ms)
+        });
         self.voices.push(Voice {
             slot: h.slot,
+            wub,
             pos: if rev { (len - 2.0).max(0.0) } else { 0.0 },
             step: m.pitch.filter(|p| *p > 0.0).unwrap_or(1.0),
             rev,
@@ -269,6 +288,13 @@ impl Transport {
     fn mix(&mut self, out: &mut [f32]) {
         let kit = &self.kit;
         self.voices.retain_mut(|v| {
+            if let Some(st) = v.wub.as_mut() {
+                for o in out.iter_mut() {
+                    if st.done() { return false; }
+                    *o += st.next() * v.gain;
+                }
+                return !st.done();
+            }
             let src = match kit.voices.get(v.slot).and_then(|s| s.as_ref()) { Some(s) => &s.mono, None => return false };
             let last = src.len().saturating_sub(1);
             if last == 0 { return false; }

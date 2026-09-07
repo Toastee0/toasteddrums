@@ -248,9 +248,9 @@ fn tools() -> Value {
         t("track_add", "Add a track. len is in sixteenth steps: 16 = 4/4 bar, 12 = 3/4, 14 = 7/8. pads maps the 4 plates to kit slots for this track; keys maps MIDI notes to slots (drum mode).",
           json!({"name":{"type":"string"},"len":{"type":"integer"},"pads":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},
                  "keys":{"type":"object","additionalProperties":{"type":"integer"}}}), vec!["name","len"]),
-        t("track_set", "Edit a track's name, len, pads, keys or mute.",
+        t("track_set", "Edit a track's name, len, pads, keys, mute or intensity (0 always plays, 1-3 are layers a game or live set brings in as things heat up).",
           json!({"track":{"type":"integer"},"name":{"type":"string"},"len":{"type":"integer"},"pads":{"type":"array","items":{"type":"integer"}},
-                 "keys":{"type":"object","additionalProperties":{"type":"integer"}},"mute":{"type":"boolean"}}), vec!["track"]),
+                 "keys":{"type":"object","additionalProperties":{"type":"integer"}},"mute":{"type":"boolean"},"intensity":{"type":"integer"}}), vec!["track"]),
         t("track_clear", "Remove every hit from a track.", json!({"track":{"type":"integer"}}), vec!["track"]),
         t("track_remove", "Delete a track. The last track cannot be removed.", json!({"track":{"type":"integer"}}), vec!["track"]),
         t("hit_set", "Set the hits on one cell (replaces). Empty list clears it.",
@@ -311,7 +311,7 @@ fn call(st: &Arc<Studio>, name: &str, a: &Value) -> Result<Value, String> {
                 "bpm": s.bpm,
                 "kit": *st.kit_path.lock().unwrap(),
                 "tracks": s.tracks.iter().enumerate().map(|(i,t)| json!({
-                    "index": i, "name": t.name, "len": t.len, "pads": t.pads, "mute": t.mute,
+                    "index": i, "name": t.name, "len": t.len, "pads": t.pads, "mute": t.mute, "intensity": t.intensity,
                     "hits": t.cells.iter().map(|c| c.len()).sum::<usize>()})).collect::<Vec<_>>(),
                 "cycle_steps": s.cycle_steps(),
                 "context": st.context.load(Ordering::Relaxed),
@@ -368,6 +368,7 @@ fn call(st: &Arc<Studio>, name: &str, a: &Value) -> Result<Value, String> {
                   for (k, v) in p.iter().take(4).enumerate() { t.pads[k] = v.as_u64().unwrap_or(0) as usize; } }
               if let Some(k) = parse_keys(arg(a, "keys")) { t.keys = k; }
               if let Some(m) = arg(a, "mute").and_then(Value::as_bool) { t.mute = m; }
+              if let Some(v) = arg(a, "intensity").and_then(Value::as_u64) { t.intensity = v.min(3) as u8; }
               t.normalise(); }
             st.push_song()?; ok(format!("track {i} updated"))
         }

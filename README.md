@@ -11,6 +11,15 @@ Samples: [analogcode/toykeyboards](https://github.com/analogcode/toykeyboards)
 - **kit** (`kits/*.kit`): 9 voices, one per annunciator tile (slot → tile x=slot%3, y=slot/3),
   each with a colour and a hit WAV.
 - **pattern** (`kits/*.pat`): 9 rows × 16 steps, `.`/`x`/`X`/`1-9` velocity, `bpm N`.
+- **wub** (`src/wub.rs`): `synth:wub` in a kit line is a bass synth computed per hit, not a sample:
+  two detuned saws (or squares) over a sine at the note, through a resonant low-pass swept
+  floor..cutoff by a tempo-synced LFO (`wob` wobbles per beat), hold-then-release envelope,
+  drive. Per-hit `pitch` moves the note; the wobble stays on the grid. Parameters in the file header.
+- **intensity** on a track (0..3): a layer tag for a game or live set; the Sand Walker game
+  unmutes tracks up to its danger level. `track_set` takes it; the UI shows `iN`.
+- **bake** `<kit> <song.json> <outdir>`: game export. Float WAV per sample slot, `song.txt`
+  (flat text: voices, wub parameters, tracks, hits with mods), `song.json`, and `golden.wav`
+  (one polymeter cycle) that the game's C port of the mixer is tested against.
 - `src/wav.rs` RIFF reader/writer · `src/kit.rs` · `src/seq.rs` sequencer+mixer+glow ·
   `src/vis.rs` 3×3 frame + COBS/CRC16 packet (byte-identical to `annunciator-rs/frame.rs`).
 
@@ -18,6 +27,7 @@ Samples: [analogcode/toykeyboards](https://github.com/analogcode/toykeyboards)
 ```sh
 cargo test
 cargo build --release
+./target/release/toasteddrums bake kits/fight.kit songs/fight.json ../Sand walker/assets/music/fight   # game export
 ./target/release/toasteddrums render kits/mt240.kit kits/basic.pat out/basic.wav 2   # offline mix
 ./target/release/toasteddrums show   kits/mt240.kit kits/basic.pat                   # per-step 3×3 frames
 ```

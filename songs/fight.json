@@ -1,0 +1,66 @@
+{
+  "bpm": 128.0,
+  "tracks": [
+    {
+      "name": "core", "len": 16, "intensity": 0,
+      "cells": [
+        [{"slot": 0, "vel": 127}, {"slot": 3, "vel": 70}],
+        [],
+        [{"slot": 3, "vel": 60}],
+        [],
+        [{"slot": 0, "vel": 127}, {"slot": 3, "vel": 70}],
+        [],
+        [{"slot": 3, "vel": 60}],
+        [],
+        [{"slot": 0, "vel": 127}, {"slot": 3, "vel": 70}],
+        [],
+        [{"slot": 3, "vel": 60}],
+        [],
+        [{"slot": 0, "vel": 127}, {"slot": 3, "vel": 70}],
+        [],
+        [{"slot": 4, "vel": 80}],
+        []
+      ]
+    },
+    {
+      "name": "snare", "len": 16, "intensity": 1,
+      "cells": [
+        [], [], [], [],
+        [{"slot": 1, "vel": 120}], [], [], [{"slot": 2, "vel": 60}],
+        [], [], [{"slot": 0, "vel": 100}], [],
+        [{"slot": 1, "vel": 120}], [], [], [{"slot": 2, "vel": 70, "mods": {"crush": 5}}]
+      ]
+    },
+    {
+      "name": "wub", "len": 16, "intensity": 2,
+      "cells": [
+        [{"slot": 5, "vel": 127}],
+        [], [],
+        [{"slot": 5, "vel": 100, "mods": {"decay_ms": 160}}],
+        [], [],
+        [{"slot": 5, "vel": 120, "mods": {"pitch": 1.1892}}],
+        [],
+        [{"slot": 5, "vel": 127}],
+        [], [],
+        [{"slot": 5, "vel": 110, "mods": {"pitch": 0.8909}}],
+        [], [],
+        [{"slot": 5, "vel": 100, "mods": {"pitch": 2.0, "decay_ms": 150}}],
+        []
+      ]
+    },
+    {
+      "name": "fills", "len": 12, "intensity": 3,
+      "cells": [
+        [{"slot": 6, "vel": 110}],
+        [], [],
+        [{"slot": 7, "vel": 100}],
+        [], [],
+        [{"slot": 8, "vel": 90}],
+        [], [],
+        [{"slot": 6, "vel": 100, "mods": {"pitch": 0.8}}],
+        [{"slot": 6, "vel": 80}],
+        []
+      ]
+    }
+  ]
+}

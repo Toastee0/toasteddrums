@@ -1,0 +1,17 @@
+# ToastedDrums kit: Sand Walker fight music. bigbeat.kit with the cowbell swapped for a
+# wub in slot 5, and the kick tuned to sit under it (f0 44 so the sub and the wub's
+# A1 don't fight for the same octave).
+#
+# The wub: two detuned saws over a sine at the note, swept 80..1600 Hz at eighth-note
+# wobbles, driven hard. It is synthesised per hit, so a per-hit pitch= moves the note and
+# the wobble stays on the grid.
+name Fight
+voice 0 kick    255,40,0    synth:kick f0=44 sweep=140 decay=420 click=0.4 drive=3
+voice 1 snare   255,200,0   ../toykeyboards/Keys (MT240)/individual drums/MT240_snare_med.wav pitch=0.85 drive=4 crush=9
+voice 2 stick   255,0,120   ../toykeyboards/Keys (MT240)/individual drums/MT240_snare_sidetap.wav pitch=0.7 drive=3 crush=7
+voice 3 hat     0,200,255   ../toykeyboards/Keys (MT240)/individual drums/MT240_hihat_closed.wav pitch=1.1 crush=8 gain=0.5
+voice 4 ohat    0,255,160   ../toykeyboards/Keys (MT240)/individual drums/MT240_hihat_open.wav pitch=0.9 drive=2 gain=0.5
+voice 5 wub     0,255,255   synth:wub f0=55 wave=saw detune=9 sub=0.7 cutoff=1600 floor=80 res=0.8 wob=2 hold=200 decay=500 drive=3.5
+voice 6 tomlo   120,0,255   ../toykeyboards/Keys (MT240)/individual drums/MT240_electom_low.wav pitch=0.55 drive=4
+voice 7 tomhi   200,80,255  ../toykeyboards/Keys (MT240)/individual drums/MT240_electom_high.wav pitch=0.7 drive=4 rev
+voice 8 crash   255,255,255 ../toykeyboards/Keys (MT240)/individual drums/MT240_crash_long.wav pitch=0.8 drive=3 gain=0.7
