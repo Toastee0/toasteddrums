@@ -101,6 +101,19 @@ on phobos). The one crate, `cpal`, pulls in Microsoft's `windows-*` bindings, an
 mingw-w64 is required: `winget install BrechtSanders.WinLibs.POSIX.UCRT`, which puts
 `mingw64\bin` on the user PATH. Open a new shell after installing it.
 
+**Build with `.\kit\build.ps1`, not `cargo build --release` directly.** Windows keeps a
+running image file open, so the moment anything is holding
+`target\release\toasteddrums.exe` — the UI window, a live MCP server, a stray `live` session
+— a release build dies with `Access is denied (os error 5)`. That is the normal state of
+this project, since the point is to edit the tracker while it is connected to something.
+
+Windows locks an executable's *contents* but not its *directory entry*, so a running exe can
+be **renamed**. `kit/build.ps1` parks whatever is holding the path under a
+`toasteddrums-inuse-*.exe` name, leaves that process running happily, and lets cargo link a
+fresh binary into the freed path. Parked copies are swept on a later build once their
+process has exited. `kit/mcp.cmd` attacks the same problem from the other end, launching the
+MCP server from a per-launch copy so it never holds the build path at all.
+
 **Audio is `cpal`, pinned `=0.18.2`, default features.** It replaced a hand-rolled `waveOut`
 after a pure sine measured an underrun every fourth buffer regardless of pacing: waveOut is a
 shim over the WASAPI shared-mode engine and drains its whole queue once per ~10 ms period,
