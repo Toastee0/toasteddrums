@@ -17,9 +17,17 @@ Samples: [analogcode/toykeyboards](https://github.com/analogcode/toykeyboards)
   drive. Per-hit `pitch` moves the note; the wobble stays on the grid. Parameters in the file header.
 - **intensity** on a track (0..3): a layer tag for a game or live set; the Sand Walker game
   unmutes tracks up to its danger level. `track_set` takes it; the UI shows `iN`.
-- **bake** `<kit> <song.json> <outdir>`: game export. Float WAV per sample slot, `song.txt`
-  (flat text: voices, wub parameters, tracks, hits with mods), `song.json`, and `golden.wav`
-  (one polymeter cycle) that the game's C port of the mixer is tested against.
+- **bake** `<kit> <song.json> <outdir> [rate]`: game export. Float WAV per sample slot,
+  `song.txt` (flat text: voices, wub parameters, tracks, hits with mods), `song.json`, and
+  `golden.wav` (one polymeter cycle) that the game's C port of the mixer is tested against.
+  The game's rate is its own business: `[rate]` overrides the song's, defaulting to it.
+- **project rate**: `song.json` carries a `"rate"` (default 48000) and everything mixes
+  there. A kit is loaded FOR that rate — synths generate at it, and a sample recorded at
+  another rate resamples once at load (windowed sinc), so the mixer never asks what rate a
+  voice is in. A sample already at the project rate is passed through untouched, which is
+  what keeps the 44.1 kHz songs producing the bytes they always did. The engine (`mcp`/`ui`)
+  uses the **device's** native rate as its project rate, so the output resampler that used
+  to sit in the callback is not built at all.
 - `src/wav.rs` RIFF reader/writer · `src/kit.rs` · `src/seq.rs` sequencer+mixer+glow ·
   `src/vis.rs` 3×3 frame + COBS/CRC16 packet (byte-identical to `annunciator-rs/frame.rs`).
 
@@ -116,7 +124,11 @@ its learn threshold and reports uncalibrated velocity rather than inventing a ga
 owns the audio device, the pads and the song, and exposes the same verbs two ways:
 
 - **MCP over stdio** (`.mcp.json` registers it for Claude Code) — so Claude can write patterns,
-  swap kits, arm modifiers, record from the pads and render, in the conversation.
+  swap kits, arm modifiers, record from the pads and render, in the conversation. It launches
+  through `kit/mcp.cmd`, which runs the server from a per-launch **copy** of the binary:
+  Windows keeps a running image open, so a live server otherwise holds
+  `target\release\toasteddrums.exe` and `cargo build --release` dies on it with "Access is
+  denied". Editing the tracker while an agent is connected to it is the normal case here.
 - **A localhost TCP door** (`127.0.0.1:<door-port>`, same newline-delimited JSON-RPC, same tool
   names) — for the operator UI. Both edit ONE song; there are never two copies.
 
@@ -177,7 +189,33 @@ fits without the grid scrolling sideways. Edits round-trip through the door in w
 frame; the UI applies each edit to its own snapshot at once and a poll that raced with a
 queued edit is dropped, so nothing flickers.
 
-## Next
+## No allocation on the audio thread
+
+`src/noalloc.rs` wraps the global allocator in debug builds and counts any allocation made
+inside the audio callback. It counts rather than panics on purpose: the panic machinery
+allocates, and so does formatting, so doing either from inside `alloc` recurses. Release
+compiles the check away entirely.
+
+It exists because this class of bug never fails loudly -- it fails as an intermittent click,
+under load, on someone else's machine. `cargo test` now drives 400 buffers with a kick,
+sample, wub and string all sounding and asserts the count never moves.
+
+## Where this is going
+
+`PLAN.md` is the roadmap: a procedural foley engine (a node graph that synthesises a sound
+from a description of it) that the tracker plays and the operator's games link at load, so a
+game ships profiles rather than recordings. Read it before starting anything large -- its
+locked decisions are meant to be binding, and it says what is deliberately still open.
+
+**Phase 0 is done.** Every voice kind now goes through one `kit::Source` enum, a kit is
+loaded FOR a project rate rather than inheriting whatever its first sample happened to be,
+and the three allocations that were sitting in the audio callback are gone. Verified against
+the September bake: `golden.wav`, all eight slot WAVs and `song.txt` byte-for-byte identical.
+
+**Phase 0b is next**: cut the voice-buffer seam once -- variant-indexed, channel-interleaved,
+stereo Transport -- before the graph lands on top of it.
+
+## Next (hardware, independent of the engine work)
 1. Verify MIDI on the Casio. `src/midi.rs` (winmm, zero crates) is built and unit-tested --
    drum mode maps notes to slots through the track key map, chromatic mode pitches one slot
    by note, and the keys have their own context and armed mods -- but it has never met the

@@ -15,8 +15,12 @@
 //!   drive / crush / gain   post-filter, as for samples. `rev` is meaningless and ignored.
 //!
 //! Every operation here is mirrored in the game's C port (Sand walker, src/tracker.c). Keep
-//! the order of operations identical when changing anything: the golden test compares the
-//! two renders sample by sample.
+//! the order of operations identical when changing anything: the golden test compares the two
+//! renders against a TOLERANCE (max-abs 2e-3, RMS 1e-4 — see that repo's
+//! tests/test_tracker.c), not sample for sample. The two agree exactly on Windows only
+//! because Rust windows-gnu and GCC link the same mingw-w64 libm; `next` below calls sin,
+//! cos, powf and tanh per sample into a recursive filter, so on another libm the last ulp
+//! compounds. Exact equality is a property of one toolchain, never of this code.
 
 use std::f32::consts::PI;
 
