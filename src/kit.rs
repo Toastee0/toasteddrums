@@ -4,8 +4,9 @@
 //!   voice <slot 0-8> <label> <r,g,b> <source> [mutations...]
 //! Paths are relative to the kit file's directory.
 //!
-//! <source> is a WAV path, or `synth:kick`. Mutations are trailing tokens, applied in the
-//! order listed below and BAKED into the voice at load — zero cost at play time:
+//! <source> is a WAV path, `synth:kick`, `synth:wub`, or `synth:string`. Mutations are
+//! trailing tokens, applied in the order listed below and BAKED into the voice at load —
+//! zero cost at play time (a wub or string is generated per hit instead; see wub.rs / below):
 //!   pitch=<ratio>  playback speed: 0.5 = an octave down, 2.0 = up. Resampled once here.
 //!   rev            reverse
 //!   crush=<bits>   quantise to 2^bits levels: 8 is gritty, 4 is destroyed
@@ -18,12 +19,21 @@
 //!   decay=<ms>     amplitude decay to -60 dB                        (default 400)
 //!   click=<0-1>    a few ms of noise on the attack, for the beater  (default 0.3)
 //!
+//! synth:string parameters (a plucked string -- see string.rs -- all optional):
+//!   note=<0-127>   the MIDI note a hit plays when it names none      (default 28, E1)
+//!   pick=<.02-.5>  pluck position along the string, 0.12 near the bridge  (default 0.12)
+//!   tone=<0-1>     pick hardness: 1 a plectrum, 0.2 a thumb          (default 0.55)
+//!   damp=<0-0.9>   how fast the highs die; high is a palm mute       (default 0.3)
+//!   decay=<ms>     time to -60 dB                                    (default 1600)
+//!   lp=<hz>        output lowpass                                    (default 4500)
+//!
 //! This is the whole "make it sound like Prodigy instead of a music class" mechanism:
 //! those records are samples mutated hard and looped at the right cadence. Two references
 //! measured (tools/analyze_track.py): half of everything sits below 120 Hz and hats are
 //! under 1%, so the sub kick is a sine with a pitch drop -- a sample cannot give you that,
 //! but an 808 is exactly a sine -- and the toy-keyboard hits get pitched down and driven.
 
+use crate::string;
 use crate::wav::Wav;
 use std::path::Path;
 use crate::wub::{self, WubParams};
@@ -50,6 +60,12 @@ struct Muts {
     res: Option<f32>,
     wob: Option<f32>,
     hold: Option<f32>,
+    /// synth:string parameters (see string.rs)
+    note: Option<u8>,
+    pick: Option<f32>,
+    tone: Option<f32>,
+    damp: Option<f32>,
+    lp: Option<f32>,
 }
 
 /// Peels mutation tokens off the right of `rest` until one is not a mutation; what is
@@ -81,6 +97,11 @@ fn split_mutations(rest: &str) -> (&str, Muts) {
                     "res"   => { m.res = f; true }
                     "wob"   => { m.wob = f; true }
                     "hold"  => { m.hold = f; true }
+                    "note"  => { m.note = v.parse().ok(); true }
+                    "pick"  => { m.pick = f; true }
+                    "tone"  => { m.tone = f; true }
+                    "damp"  => { m.damp = f; true }
+                    "lp"    => { m.lp = f; true }
                     _ => false,
                 }
             }
@@ -164,6 +185,10 @@ pub struct Voice {
     pub mono: Vec<f32>,
     /// Some for a synth:wub voice: the Transport synthesises it per hit instead of reading `mono`
     pub wub: Option<WubParams>,
+    /// Some for a synth:string voice (a plucked string, see string.rs): the Transport rings
+    /// its own `Ks` per hit instead of reading `mono`, which here is only a fixed-note
+    /// preview for the sample-only mixers (bench `show`/`live`, bake's fallback WAV).
+    pub string: Option<string::Params>,
 }
 
 #[derive(Debug)]
@@ -228,7 +253,26 @@ impl Kit {
                             gain: m_or(muts.gain, 1.0),
                         };
                         let mono = wub::preview(&p, kit.rate);
-                        kit.voices[slot] = Some(Voice { label, color, mono, wub: Some(p) });
+                        kit.voices[slot] = Some(Voice { label, color, mono, wub: Some(p), string: None });
+                        continue;
+                    }
+
+                    // A string is likewise not a sample: it takes a note per hit, so it
+                    // needs its own live Ks in the Transport. `mono` here is a fixed-note
+                    // preview for the sample-only mixers, at the voice's own default note.
+                    if source == "synth:string" {
+                        if kit.rate == 0 { kit.rate = 44100; }
+                        let d = string::Params::default();
+                        let p = string::Params {
+                            note: muts.note.unwrap_or(d.note),
+                            pick: muts.pick.unwrap_or(d.pick),
+                            tone: muts.tone.unwrap_or(d.tone),
+                            damp: muts.damp.unwrap_or(d.damp),
+                            decay_ms: muts.decay.unwrap_or(d.decay_ms),
+                            lp_hz: muts.lp.unwrap_or(d.lp_hz),
+                        };
+                        let mono = string_preview(&p, kit.rate);
+                        kit.voices[slot] = Some(Voice { label, color, mono, wub: None, string: Some(p) });
                         continue;
                     }
                     let mut mono = if let Some(kind) = source.strip_prefix("synth:") {
@@ -245,7 +289,7 @@ impl Kit {
                         w.mono()
                     };
                     mutate(&mut mono, &muts);
-                    kit.voices[slot] = Some(Voice { label, color, mono, wub: None });
+                    kit.voices[slot] = Some(Voice { label, color, mono, wub: None, string: None });
                 }
                 _ => return Err(format!("line {}: unknown key {key}", ln + 1)),
             }
@@ -256,6 +300,15 @@ impl Kit {
 }
 
 fn m_or(v: Option<f32>, d: f32) -> f32 { v.unwrap_or(d) }
+
+/// A fixed-note render of a string voice at its own default note and full velocity, for the
+/// sample-only mixers that read `Voice.mono` directly rather than ringing a live `Ks`.
+fn string_preview(p: &string::Params, rate: u32) -> Vec<f32> {
+    let mut ks = string::Ks::new(rate);
+    ks.pluck(string::note_hz(p.note as f32), 1.0, p, p.damp);
+    let n = (rate as f32 * p.decay_ms / 1000.0 * 1.2) as usize;
+    (0..n).map(|_| ks.next()).collect()
+}
 
 fn parse_rgb(s: &str) -> Result<[u8; 3], String> {
     let v: Vec<u8> = s.split(',').map(|x| x.trim().parse().map_err(|_| format!("bad colour {s}"))).collect::<Result<_, _>>()?;

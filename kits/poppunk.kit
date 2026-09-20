@@ -1,0 +1,31 @@
+# ToastedDrums kit: pop punk. Same nine slots and the same MT240 samples as the other kits,
+# but mutated a lot less than bigbeat -- this music is played, not built out of loops, so the
+# drums want to sound like someone hitting them rather than like a wall.
+#
+# The one that is not a sample: slot 2 is a PLAYED voice, a plucked string (string.rs). It
+# takes a note per hit, so a bassline is notes in the tracker rather than nine copies of a
+# sample at nine pitches. Its drive= is applied per hit at mix time, not baked, because
+# there is no buffer to bake it into.
+#
+# Bass settings, and why. note=38 is D2, the root of this song's key, so an unmarked hit
+# already plays the tonic. pick=0.10 is picking near the bridge: it notches every tenth
+# harmonic and tilts the first few, which is the instrument's nasal edge. tone=0.9 is a hard
+# plectrum -- measured, it is what puts anything at all above 500 Hz, and a bass with nothing
+# there disappears on a laptop speaker even while it measures fine. decay=1500 rings past an
+# eighth at 150 BPM so the notes join into a line; shorten it per hit with the L decay mod
+# when you want the gap back. damp=0.18 is bright, because drive=3.2 wants harmonics to work
+# on, and lp=5500 catches the fizz after it.
+#
+# No gain= : with the level chain fixed (gain trims AFTER the drive, see song.rs) the string
+# needs no trim at all -- measured, it lands about 2.5 dB under these drums at master 1.0,
+# which is where this music sits.
+name PopPunk
+voice 0 kick    255,40,0    synth:kick f0=55 sweep=150 decay=280 click=0.55 drive=2
+voice 1 snare   255,200,0   ../toykeyboards/Keys (MT240)/individual drums/MT240_snare_med.wav pitch=0.95 drive=2.2
+voice 2 bass    40,110,255  synth:string note=38 pick=0.10 tone=0.9 damp=0.18 decay=1500 lp=5500 drive=3.2
+voice 3 hat     0,200,255   ../toykeyboards/Keys (MT240)/individual drums/MT240_hihat_closed.wav pitch=1.05 gain=0.45
+voice 4 ohat    0,255,160   ../toykeyboards/Keys (MT240)/individual drums/MT240_hihat_open.wav gain=0.5
+voice 5 stick   255,0,120   ../toykeyboards/Keys (MT240)/individual drums/MT240_snare_sidetap.wav pitch=0.9 gain=0.8
+voice 6 tomlo   120,0,255   ../toykeyboards/Keys (MT240)/individual drums/MT240_electom_low.wav pitch=0.8 drive=2
+voice 7 tomhi   200,80,255  ../toykeyboards/Keys (MT240)/individual drums/MT240_electom_high.wav pitch=0.95 drive=2
+voice 8 crash   255,255,255 ../toykeyboards/Keys (MT240)/individual drums/MT240_crash_long.wav pitch=0.95 gain=0.65

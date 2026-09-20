@@ -490,7 +490,8 @@ fn call(st: &Arc<Studio>, name: &str, a: &Value) -> Result<Value, String> {
             let song = st.song.lock().unwrap().clone();
             let kit = st.kit.read().unwrap().clone();
             let steps = arg(a, "steps").and_then(Value::as_u64).map(|v| v as usize).unwrap_or_else(|| song.cycle_steps());
-            let data = Transport::render(kit.clone(), song, steps);
+            let master = *st.master.lock().unwrap();
+            let data = Transport::render(kit.clone(), song, steps, master);
             let peak = data.iter().fold(0f32, |m, s| m.max(s.abs()));
             let w = crate::wav::Wav { rate: kit.rate, channels: 1, data };
             std::fs::write(p, w.to_bytes()).map_err(|e| format!("{p}: {e}"))?;

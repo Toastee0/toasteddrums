@@ -15,6 +15,7 @@ mod midi;
 mod pads;
 mod seq;
 mod song;
+mod string;
 mod ui;
 mod vis;
 mod wav;
@@ -28,6 +29,11 @@ fn main() {
         Some("render") if a.len() >= 5 => render(&a[2], &a[3], &a[4], a.get(5).and_then(|b| b.parse().ok()).unwrap_or(2)),
         Some("show") if a.len() >= 4 => show(&a[2], &a[3]),
         Some("bake") if a.len() >= 5 => bake(&a[2], &a[3], &a[4]),
+        // `song <kit> <song.json> <out.wav> [steps] [master]`: the tracker's own model,
+        // rather than the bench's flat .pat, rendered straight to a WAV.
+        Some("song") if a.len() >= 5 => render_song(&a[2], &a[3], &a[4],
+            a.get(5).and_then(|n| n.parse().ok()),
+            a.get(6).and_then(|m| m.parse().ok()).unwrap_or(song::DEFAULT_MASTER)),
         // The tracker as an MCP server over stdio: `mcp [kit] [COMn] [door-port]`, the last
         // two in either order. Nothing but protocol may go to stdout in this mode. This arm
         // yields a Result like every other -- `?` cannot be used in `fn main`, which returns ().
@@ -72,6 +78,7 @@ fn main() {
         _ => Err(concat!(
             "usage: toasteddrums render <kit> <pattern> <out.wav> [bars]\n",
             "                  show   <kit> <pattern>\n",
+            "                  song   <kit> <song.json> <out.wav> [steps] [master]  tracker model → WAV\n",
             "                  pads   [port] [baud]\n",
             "                  live   <kit> [port] [map] [gain]   map e.g. 0,3,1,8 = pad→slot; gain default 2.0\n",
             "                  mcp    [kit] [COMn] [door-port]     MCP server on stdio (kit default kits/bigbeat.kit)\n",
@@ -288,6 +295,26 @@ fn render(kit: &str, pat: &str, out: &str, bars: usize) -> Result<(), String> {
     Ok(())
 }
 
+fn render_song(kit: &str, song_path: &str, out: &str, steps: Option<usize>, master: f32) -> Result<(), String> {
+    let k = std::sync::Arc::new(kit::Kit::load(&find_data(kit)?)?);
+    let sp = find_data(song_path)?;
+    let mut s: song::Song = serde_json::from_str(&std::fs::read_to_string(&sp)
+        .map_err(|e| format!("{}: {e}", sp.display()))?)
+        .map_err(|e| format!("{}: {e}", sp.display()))?;
+    s.normalise();
+    let steps = steps.unwrap_or_else(|| s.cycle_steps());
+    let (bpm, tracks) = (s.bpm, s.tracks.len());
+    let data = song::Transport::render(k.clone(), s, steps, master);
+    let peak = data.iter().fold(0f32, |m, x| m.max(x.abs()));
+    let rms = (data.iter().map(|x| x * x).sum::<f32>() / data.len() as f32).sqrt();
+    let w = wav::Wav { rate: k.rate, channels: 1, data };
+    std::fs::write(out, w.to_bytes()).map_err(|e| format!("{out}: {e}"))?;
+    eprintln!("kit '{}' @ {} Hz, {bpm} bpm, {tracks} tracks, {steps} steps, master {master} → {out} \
+               ({:.2} s, peak {peak:.2}, rms {rms:.3}, crest {:.1} dB)",
+              k.name, k.rate, w.frames() as f32 / k.rate as f32, 20.0 * (peak / rms.max(1e-9)).log10());
+    Ok(())
+}
+
 /// `bake <kit> <song.json> <outdir>`: everything a game needs to play the song with no kit
 /// loader, resampler or JSON parser of its own. Written to `outdir`:
 ///   slotN.wav   each sample voice after its load-time mutations, 32-bit float mono at
@@ -351,7 +378,7 @@ fn bake(kit_path: &str, song_path: &str, outdir: &str) -> Result<(), String> {
     std::fs::write(out.join("song.json"), serde_json::to_string_pretty(&song).unwrap()).map_err(|e| format!("song.json: {e}"))?;
 
     let steps = song.cycle_steps();
-    let data = song::Transport::render(k.clone(), song.clone(), steps);
+    let data = song::Transport::render(k.clone(), song.clone(), steps, song::DEFAULT_MASTER);
     let peak = data.iter().fold(0f32, |m, s| m.max(s.abs()));
     let w = wav::Wav { rate: k.rate, channels: 1, data };
     std::fs::write(out.join("golden.wav"), w.to_bytes_f32()).map_err(|e| format!("golden.wav: {e}"))?;

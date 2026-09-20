@@ -8,6 +8,11 @@
 //! for THAT hit only. That is the "any modifier, any note" rule: nothing is per-track that
 //! could be per-hit.
 //!
+//! A STRING voice (kit.rs's synth:string) takes a NOTE and can be articulated: `note` picks
+//! the pitch, `damp` is the palm on the strings, `slide_ms` moves to the note without picking
+//! it again, and `decay_ms` is the note ending. A string is monophonic -- one neck -- so a
+//! hit on a slot that is already sounding takes it over.
+//!
 //! A Track also carries a pad map: which kit slot each of the four plates plays while this
 //! track is the current context. One instrument, many tracks.
 //!
@@ -19,6 +24,7 @@
 //! return these exact shapes.
 
 use crate::kit::Kit;
+use crate::string::Ks;
 use crate::wub::WubState;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -36,8 +42,20 @@ pub struct Mods {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub rev: Option<bool>,
     /// linear level multiplier
     #[serde(default, skip_serializing_if = "Option::is_none")] pub gain: Option<f32>,
-    /// force the hit to fade to -60 dB by this many ms, regardless of sample length
+    /// force the hit to fade to -60 dB by this many ms, regardless of sample length. On a
+    /// string voice this is the note ending: the gate, and the difference between eighth
+    /// notes and DRIVING eighth notes.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub decay_ms: Option<f32>,
+    /// MIDI note for a string voice: 28 = E1, a bass's low string. A sampled or wub voice
+    /// ignores this; `pitch` is its equivalent, and on a string `pitch` is a ratio applied
+    /// ON TOP of the note.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub note: Option<u8>,
+    /// how fast a string voice loses its highs, 0..0.9. High is the heel of the hand resting
+    /// on the strings -- a palm mute; with a low `vel` it is a ghost note.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub damp: Option<f32>,
+    /// slide to this hit's note over this many ms rather than plucking it, when the string is
+    /// already sounding. The turnaround slide, and it needs no note-off to work.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub slide_ms: Option<f32>,
 }
 
 impl Mods {
@@ -50,6 +68,9 @@ impl Mods {
             rev: other.rev.or(self.rev),
             gain: other.gain.or(self.gain),
             decay_ms: other.decay_ms.or(self.decay_ms),
+            note: other.note.or(self.note),
+            damp: other.damp.or(self.damp),
+            slide_ms: other.slide_ms.or(self.slide_ms),
         }
     }
 }
@@ -154,6 +175,11 @@ impl Song {
 struct Voice {
     /// Some: a wub being synthesised; the sample fields below are then unused
     wub: Option<WubState>,
+    /// True: ringing `Transport::strings[slot]`; the sample fields below are then unused.
+    /// The string itself lives in the Transport and not here because it owns a delay line --
+    /// one per slot, allocated once, since a string is monophonic anyway and nothing may
+    /// allocate on the audio thread.
+    is_string: bool,
     slot: usize,
     pos: f32,       // fractional source cursor
     step: f32,      // cursor advance per kit-rate sample (pitch)
@@ -186,6 +212,9 @@ pub struct Transport {
     pub global_step: u64,
     pos_in_step: usize,
     voices: Vec<Voice>,
+    /// One string per kit slot, allocated up front. Slots backed by a sample or a wub simply
+    /// never ring theirs.
+    strings: Vec<Ks>,
     pub master: f32,
     /// per-slot glow 0..1 for any display, decays per mix
     pub glow: [f32; 9],
@@ -193,8 +222,9 @@ pub struct Transport {
 
 impl Transport {
     pub fn new(kit: Arc<Kit>, song: Song) -> Transport {
+        let strings = (0..9).map(|_| Ks::new(kit.rate)).collect();
         Transport { kit, song, playing: false, global_step: 0, pos_in_step: 0,
-                    voices: Vec::with_capacity(32), master: DEFAULT_MASTER, glow: [0.0; 9] }
+                    voices: Vec::with_capacity(32), strings, master: DEFAULT_MASTER, glow: [0.0; 9] }
     }
 
     pub fn apply(&mut self, c: Cmd) {
@@ -216,11 +246,50 @@ impl Transport {
 
     fn start(&mut self, h: &Hit) {
         let v = match self.kit.voices.get(h.slot).and_then(|v| v.as_ref()) { Some(v) => v, None => return };
-        if self.voices.len() >= 32 { self.voices.remove(0); }
         let m = &h.mods;
+        let sr = self.kit.rate as f32;
+
+        // A string is played, not replayed: it takes a note per hit and rings on in
+        // `self.strings[slot]` rather than being resynthesised as a one-shot Voice.
+        if let Some(p) = v.string.clone() {
+            // `pitch` is a ratio on top of the note rather than a replacement for it, so the
+            // TUNE knob still detunes a string the way it detunes a sample.
+            let f0 = crate::string::note_hz(m.note.unwrap_or(p.note) as f32)
+                * m.pitch.filter(|x| *x > 0.0).unwrap_or(1.0);
+            let damp = m.damp.unwrap_or(p.damp);
+            let sounding = self.voices.iter().any(|x| x.slot == h.slot && x.is_string);
+            let ks = &mut self.strings[h.slot];
+            match m.slide_ms.filter(|x| *x > 0.0) {
+                // A slide on a ringing string is the fretting hand moving: the delay line
+                // changes length and the string is never picked again. With nothing sounding
+                // there is nothing to slide from, so it is an ordinary note.
+                Some(ms) if sounding => { ks.glide_to(f0, ms); ks.set_damp(damp); }
+                _ => ks.pluck(f0, h.vel as f32 / 127.0, &p, damp),
+            }
+            // One neck: a second note on this slot takes the string over rather than
+            // stacking a second copy of it.
+            self.voices.retain(|x| x.slot != h.slot);
+            if self.voices.len() >= 32 { self.voices.remove(0); }
+            self.voices.push(Voice {
+                slot: h.slot,
+                wub: None,
+                is_string: true,
+                pos: 0.0,
+                step: 1.0,
+                rev: false,
+                gain: (h.vel.clamp(1, 127) as f32 / 127.0).powi(2) * m.gain.unwrap_or(1.0),
+                drive: m.drive.filter(|d| *d > 0.0),
+                crush: m.crush.filter(|b| (1..16).contains(b)).map(|b| (1u32 << b) as f32),
+                decay_k: m.decay_ms.filter(|d| *d > 0.0).map(|d| (-(1000.0f32.ln()) / (sr * d / 1000.0)).exp()),
+                env: 1.0,
+            });
+            self.glow[h.slot] = 1.0;
+            return;
+        }
+
+        if self.voices.len() >= 32 { self.voices.remove(0); }
         let len = v.mono.len() as f32;
         let rev = m.rev.unwrap_or(false);
-        let sr = self.kit.rate as f32;
         // A wub is synthesised: per-hit drive/crush override the kit's, pitch moves the
         // note, decay_ms the release, velocity the gain (below). The wobble follows the bpm.
         let wub = v.wub.as_ref().map(|p| {
@@ -232,6 +301,7 @@ impl Transport {
         self.voices.push(Voice {
             slot: h.slot,
             wub,
+            is_string: false,
             pos: if rev { (len - 2.0).max(0.0) } else { 0.0 },
             step: m.pitch.filter(|p| *p > 0.0).unwrap_or(1.0),
             rev,
@@ -287,7 +357,21 @@ impl Transport {
 
     fn mix(&mut self, out: &mut [f32]) {
         let kit = &self.kit;
+        let strings = &mut self.strings;
         self.voices.retain_mut(|v| {
+            if v.is_string {
+                let ks = match strings.get_mut(v.slot) { Some(k) => k, None => return false };
+                let norm = v.drive.map(|d| d.tanh());
+                for o in out.iter_mut() {
+                    if ks.done() { return false; }
+                    let mut s = ks.next() * v.gain * v.env;
+                    if let Some(lv) = v.crush { s = (s * lv).round() / lv; }
+                    if let (Some(d), Some(n)) = (v.drive, norm) { s = (s * d).tanh() / n; }
+                    *o += s;
+                    if let Some(k) = v.decay_k { v.env *= k; if v.env < 0.001 { return false; } }
+                }
+                return !ks.done();
+            }
             if let Some(st) = v.wub.as_mut() {
                 for o in out.iter_mut() {
                     if st.done() { return false; }
@@ -314,9 +398,12 @@ impl Transport {
         });
     }
 
-    /// Offline render of `cycles` full polymeter cycles (or `steps` if given) to kit-rate mono.
-    pub fn render(kit: Arc<Kit>, song: Song, steps: usize) -> Vec<f32> {
+    /// Offline render of `cycles` full polymeter cycles (or `steps` if given) to kit-rate
+    /// mono, at `master` gain -- the same knob the live transport runs at, so a render
+    /// matches what was being played rather than whatever the default happened to be.
+    pub fn render(kit: Arc<Kit>, song: Song, steps: usize, master: f32) -> Vec<f32> {
         let mut t = Transport::new(kit, song);
+        t.master = master.max(0.0);
         t.playing = true;
         let spp = t.song.samples_per_step(t.kit.rate);
         let mut out = vec![0.0f32; spp * steps];
@@ -327,7 +414,10 @@ impl Transport {
             pos += n;
         }
         t.playing = false;
-        let mut tail = vec![0.0f32; t.kit.rate as usize];  // one second for the last hit's ring
+        // Long enough for the last hit to ring out: a second covers any drum or wub, but a
+        // string is still sounding well past that, so give a kit with one the longer tail.
+        let strings = t.kit.voices.iter().flatten().any(|v| v.string.is_some());
+        let mut tail = vec![0.0f32; (t.kit.rate as f32 * if strings { 2.5 } else { 1.0 }) as usize];
         t.fill(&mut tail);
         out.extend_from_slice(&tail);
         out
