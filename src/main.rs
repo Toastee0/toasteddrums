@@ -12,6 +12,7 @@ mod kit;
 mod live;
 mod mcp;
 mod midi;
+mod noalloc;
 mod pads;
 mod seq;
 mod song;
@@ -23,12 +24,22 @@ mod wub;
 
 use std::path::Path;
 
+/// Debug builds count any allocation made inside the audio callback; release is the plain
+/// system allocator with no branch in front of it. See noalloc.rs.
+#[global_allocator]
+static ALLOC: noalloc::Guard = noalloc::Guard;
+
+/// What the bench commands (`render`, `show`, `live`) run at. They have no song to carry a
+/// project rate, and this is the rate they produced before the project rate existed — so
+/// their output stays bit-for-bit what it was.
+const BENCH_RATE: u32 = 44100;
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let r = match a.get(1).map(String::as_str) {
         Some("render") if a.len() >= 5 => render(&a[2], &a[3], &a[4], a.get(5).and_then(|b| b.parse().ok()).unwrap_or(2)),
         Some("show") if a.len() >= 4 => show(&a[2], &a[3]),
-        Some("bake") if a.len() >= 5 => bake(&a[2], &a[3], &a[4]),
+        Some("bake") if a.len() >= 5 => bake(&a[2], &a[3], &a[4], a.get(5).and_then(|r| r.parse().ok())),
         // `song <kit> <song.json> <out.wav> [steps] [master]`: the tracker's own model,
         // rather than the bench's flat .pat, rendered straight to a WAV.
         Some("song") if a.len() >= 5 => render_song(&a[2], &a[3], &a[4],
@@ -78,6 +89,7 @@ fn main() {
         _ => Err(concat!(
             "usage: toasteddrums render <kit> <pattern> <out.wav> [bars]\n",
             "                  show   <kit> <pattern>\n",
+            "                  bake   <kit> <song.json> <outdir> [rate]   game export; rate defaults to the song's\n",
             "                  song   <kit> <song.json> <out.wav> [steps] [master]  tracker model → WAV\n",
             "                  pads   [port] [baud]\n",
             "                  live   <kit> [port] [map] [gain]   map e.g. 0,3,1,8 = pad→slot; gain default 2.0\n",
@@ -105,7 +117,7 @@ fn engine_args(rest: &[String]) -> (&str, Option<&str>, Option<u16>) {
 }
 
 fn go_live(kit_path: &str, port: &str, map_arg: Option<&str>, master: f32) -> Result<(), String> {
-    let k = kit::Kit::load(&find_data(kit_path)?)?;
+    let k = kit::Kit::load(&find_data(kit_path)?, BENCH_RATE)?;
     let map: Vec<usize> = match map_arg {
         Some(s) => {
             let v: Result<Vec<usize>, _> = s.split(',').map(|t| t.trim().parse::<usize>()).collect();
@@ -276,7 +288,7 @@ fn find_data(rel: &str) -> Result<std::path::PathBuf, String> {
 }
 
 fn load(kit: &str, pat: &str) -> Result<(kit::Kit, seq::Pattern), String> {
-    let k = kit::Kit::load(&find_data(kit)?)?;
+    let k = kit::Kit::load(&find_data(kit)?, BENCH_RATE)?;
     let pp = find_data(pat)?;
     let p = seq::Pattern::parse(&std::fs::read_to_string(&pp)
         .map_err(|e| format!("{}: {e}", pp.display()))?)?;
@@ -296,12 +308,13 @@ fn render(kit: &str, pat: &str, out: &str, bars: usize) -> Result<(), String> {
 }
 
 fn render_song(kit: &str, song_path: &str, out: &str, steps: Option<usize>, master: f32) -> Result<(), String> {
-    let k = std::sync::Arc::new(kit::Kit::load(&find_data(kit)?)?);
+    // The song is read first because it carries the project rate the kit must be loaded for.
     let sp = find_data(song_path)?;
     let mut s: song::Song = serde_json::from_str(&std::fs::read_to_string(&sp)
         .map_err(|e| format!("{}: {e}", sp.display()))?)
         .map_err(|e| format!("{}: {e}", sp.display()))?;
     s.normalise();
+    let k = std::sync::Arc::new(kit::Kit::load(&find_data(kit)?, s.rate)?);
     let steps = steps.unwrap_or_else(|| s.cycle_steps());
     let (bpm, tracks) = (s.bpm, s.tracks.len());
     let data = song::Transport::render(k.clone(), s, steps, master);
@@ -324,14 +337,18 @@ fn render_song(kit: &str, song_path: &str, out: &str, steps: Option<usize>, mast
 ///   song.json   the song as given, for loading back into the tracker
 ///   golden.wav  one full polymeter cycle plus a second of tail, rendered by the
 ///               Transport: the game's port is diffed against this
-fn bake(kit_path: &str, song_path: &str, outdir: &str) -> Result<(), String> {
+fn bake(kit_path: &str, song_path: &str, outdir: &str, rate: Option<u32>) -> Result<(), String> {
     use std::fmt::Write as _;
-    let kp = find_data(kit_path)?;
-    let k = std::sync::Arc::new(kit::Kit::load(&kp)?);
     let sp = find_data(song_path)?;
     let text = std::fs::read_to_string(&sp).map_err(|e| format!("{}: {e}", sp.display()))?;
     let mut song: song::Song = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", sp.display()))?;
+    // The game's rate is its own business: `bake` takes a target and renders everything at
+    // it, defaulting to the project's rate when the caller does not care. Normalising after
+    // so an out-of-range target is clamped like any other.
+    song.rate = rate.unwrap_or(song.rate);
     song.normalise();
+    let kp = find_data(kit_path)?;
+    let k = std::sync::Arc::new(kit::Kit::load(&kp, song.rate)?);
     let out = Path::new(outdir);
     std::fs::create_dir_all(out).map_err(|e| format!("{outdir}: {e}"))?;
 
@@ -343,7 +360,7 @@ fn bake(kit_path: &str, song_path: &str, outdir: &str) -> Result<(), String> {
     for (i, v) in k.voices.iter().enumerate() {
         let Some(v) = v else { continue };
         let name = v.label.replace(' ', "_");
-        if let Some(p) = &v.wub {
+        if let kit::Source::Wub(p) = &v.source {
             let _ = write!(s, "voice slot={i} name={name} wub f0={} wave={} detune={} sub={} cutoff={} floor={} res={} wob={} hold={} decay={} gain={}",
                            p.f0, p.wave, p.detune_cents, p.sub, p.cutoff, p.floor, p.res, p.wob, p.hold_ms, p.decay_ms, p.gain);
             if let Some(d) = p.drive { let _ = write!(s, " drive={d}"); }

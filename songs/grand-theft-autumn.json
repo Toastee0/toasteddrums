@@ -1,5 +1,6 @@
 {
  "bpm": 150.0,
+ "rate": 44100,
  "tracks": [
   {
    "name": "drums",

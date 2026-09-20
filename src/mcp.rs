@@ -86,6 +86,14 @@ impl Studio {
         self.version.fetch_add(1, Ordering::Relaxed);
         self.send(Cmd::SetSong(s))
     }
+    /// The engine mixes at one rate, fixed when the device opened. A song that names a
+    /// different one is played at the engine's rate and says so: adopting the field here
+    /// rather than ignoring it means `song_save` writes back what the song actually played
+    /// at. Returns the rate that was displaced, when there was one.
+    fn adopt_rate(&self, s: &mut Song) -> Option<u32> {
+        let rate = self.kit.read().unwrap().rate;
+        (s.rate != rate).then(|| std::mem::replace(&mut s.rate, rate))
+    }
 }
 
 /// A live hit from any input: always sounds immediately; while recording and playing it is
@@ -119,10 +127,16 @@ fn start_audio(kit: Arc<Kit>, song: Song, playing: Arc<AtomicBool>, step: Arc<At
     let dev = device_rate()?;
     let (tx, rx) = channel::<Cmd>();
     let mut t = Transport::new(kit.clone(), song);
-    let mut rs = Resampler::new(kit.rate, dev);
+    // Normally none: the kit was loaded for the device's rate, so there is nothing to
+    // convert and the transport fills the device buffer directly. The resampler is only
+    // built for a device that would not open at the project rate.
+    let mut rs = (kit.rate != dev).then(|| Resampler::new(kit.rate, dev));
     let out = Out::open(move |buf| {
         while let Ok(c) = rx.try_recv() { t.apply(c); }
-        rs.run(buf, |kb| t.fill(kb));
+        match &mut rs {
+            Some(rs) => rs.run(buf, |kb| t.fill(kb)),
+            None => t.fill(buf),
+        }
         playing.store(t.playing, Ordering::Relaxed);
         step.store(t.global_step, Ordering::Relaxed);
         phase.store((t.step_phase() * 1000.0) as u32, Ordering::Relaxed);
@@ -330,8 +344,14 @@ fn call(st: &Arc<Studio>, name: &str, a: &Value) -> Result<Value, String> {
         "song_set" => {
             let mut s: Song = serde_json::from_value(arg(a, "song").cloned().ok_or("missing 'song'")?).map_err(|e| e.to_string())?;
             s.normalise();
+            let was = st.adopt_rate(&mut s);
+            let rate = s.rate;
             *st.song.lock().unwrap() = s;
-            st.push_song()?; ok("song replaced".into())
+            st.push_song()?;
+            ok(match was {
+                Some(w) => format!("song replaced (its {w} Hz adopted the engine's {rate} Hz)"),
+                None => "song replaced".into(),
+            })
         }
         "song_save" => {
             let p = arg(a, "path").and_then(Value::as_str).ok_or("missing 'path'")?;
@@ -344,8 +364,14 @@ fn call(st: &Arc<Studio>, name: &str, a: &Value) -> Result<Value, String> {
             let text = std::fs::read_to_string(p).map_err(|e| format!("{p}: {e}"))?;
             let mut s: Song = serde_json::from_str(&text).map_err(|e| format!("{p}: {e}"))?;
             s.normalise();
+            let was = st.adopt_rate(&mut s);
+            let rate = s.rate;
             *st.song.lock().unwrap() = s;
-            st.push_song()?; ok(format!("loaded {p}"))
+            st.push_song()?;
+            ok(match was {
+                Some(w) => format!("loaded {p} (its {w} Hz adopted the engine's {rate} Hz)"),
+                None => format!("loaded {p}"),
+            })
         }
         "track_add" => {
             let name = arg(a, "name").and_then(Value::as_str).ok_or("missing 'name'")?;
@@ -459,9 +485,10 @@ fn call(st: &Arc<Studio>, name: &str, a: &Value) -> Result<Value, String> {
         }
         "kit_load" => {
             let p = arg(a, "path").and_then(Value::as_str).ok_or("missing 'path'")?;
-            let k = Arc::new(Kit::load(Path::new(p))?);
-            let running = st.kit.read().unwrap().rate;
-            if k.rate != running { return Err(format!("kit rate {} differs from the running {running} — restart the server with this kit", k.rate)); }
+            // Loaded FOR the running rate, so a kit whose samples are in another one simply
+            // resamples at load. The old "restart the server with this kit" refusal is gone.
+            let rate = st.kit.read().unwrap().rate;
+            let k = Arc::new(Kit::load(Path::new(p), rate)?);
             st.send(Cmd::SetKit(k.clone()))?;
             *st.kit.write().unwrap() = k.clone();
             *st.kit_path.lock().unwrap() = p.to_string();
@@ -635,8 +662,13 @@ pub fn serve_tcp(st: Arc<Studio>, port: u16) -> Result<(), String> {
 /// Loads the kit, opens the audio device and (optionally) the pads: the engine, with no
 /// door attached yet. `serve` adds stdio and TCP; the UI in standalone mode adds TCP only.
 pub fn open_studio(kit_path: &str, pads_port: Option<&str>) -> Result<Arc<Studio>, String> {
-    let kit = Arc::new(Kit::load(Path::new(kit_path))?);
-    let song = Song::empty(120.0);
+    // The engine's project rate IS the device's native rate. That is what makes the
+    // Resampler unnecessary rather than merely cheap: the kit is rendered at the rate the
+    // hardware is running, and nothing in the callback has to convert anything.
+    let rate = device_rate()?;
+    let kit = Arc::new(Kit::load(Path::new(kit_path), rate)?);
+    let mut song = Song::empty(120.0);
+    song.rate = rate;
     let playing = Arc::new(AtomicBool::new(false));
     let step = Arc::new(AtomicU64::new(0));
     let phase = Arc::new(AtomicU32::new(0));

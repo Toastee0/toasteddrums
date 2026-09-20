@@ -23,7 +23,7 @@
 //! Everything here is serde-serialisable: the song file is JSON, and the MCP tools take and
 //! return these exact shapes.
 
-use crate::kit::Kit;
+use crate::kit::{Kit, Source};
 use crate::string::Ks;
 use crate::wub::WubState;
 use serde::{Deserialize, Serialize};
@@ -144,19 +144,30 @@ pub fn quantise(global_step: u64, phase: f32, len: usize) -> usize {
     (target % len.max(1) as u64) as usize
 }
 
+/// The project rate for a song that does not name one. Everything mixes at the project rate
+/// and samples resample to it once, at kit load.
+pub const DEFAULT_RATE: u32 = 48000;
+
+fn default_rate() -> u32 { DEFAULT_RATE }
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Song {
     pub bpm: f32,
+    /// Everything mixes here: the kit is loaded FOR this rate, so `Kit::rate` equals it.
+    /// A song written before the field existed is 44.1 kHz by history, and says so.
+    #[serde(default = "default_rate")]
+    pub rate: u32,
     #[serde(default)]
     pub tracks: Vec<Track>,
 }
 
 impl Song {
     pub fn empty(bpm: f32) -> Song {
-        Song { bpm, tracks: vec![Track::new("drums", 16)] }
+        Song { bpm, rate: DEFAULT_RATE, tracks: vec![Track::new("drums", 16)] }
     }
     pub fn normalise(&mut self) {
         if !(20.0..=300.0).contains(&self.bpm) { self.bpm = 120.0; }
+        if !(8000..=192_000).contains(&self.rate) { self.rate = DEFAULT_RATE; }
         for t in &mut self.tracks { t.normalise(); }
     }
     pub fn samples_per_step(&self, rate: u32) -> usize {
@@ -171,19 +182,29 @@ impl Song {
 
 // ---------------------------------------------------------------------------------------
 
+/// How a sounding hit is producing samples. One variant per `kit::Source` kind that reaches
+/// the mixer -- a sample and a kick are both buffers by the time they get here, so they
+/// share one.
+enum Playing {
+    /// Reading `kit.voices[slot].mono` at a fractional cursor.
+    Buffer {
+        pos: f32,   // fractional source cursor
+        step: f32,  // cursor advance per sample (pitch)
+        rev: bool,
+    },
+    /// A wub being synthesised per hit. It applies its own drive/crush/decay from its
+    /// parameters, so the instance-level ones are not applied on top.
+    Wub(WubState),
+    /// Ringing `Transport::strings[slot]`. The string lives in the Transport rather than here
+    /// because it owns a delay line -- one per slot, allocated once, since a string is
+    /// monophonic anyway and nothing may allocate on the audio thread.
+    String,
+}
+
 /// A sounding hit with its mods resolved into per-instance state.
-struct Voice {
-    /// Some: a wub being synthesised; the sample fields below are then unused
-    wub: Option<WubState>,
-    /// True: ringing `Transport::strings[slot]`; the sample fields below are then unused.
-    /// The string itself lives in the Transport and not here because it owns a delay line --
-    /// one per slot, allocated once, since a string is monophonic anyway and nothing may
-    /// allocate on the audio thread.
-    is_string: bool,
+struct Instance {
+    play: Playing,
     slot: usize,
-    pos: f32,       // fractional source cursor
-    step: f32,      // cursor advance per kit-rate sample (pitch)
-    rev: bool,
     gain: f32,
     drive: Option<f32>,
     crush: Option<f32>, // levels
@@ -211,20 +232,26 @@ pub struct Transport {
     pub playing: bool,
     pub global_step: u64,
     pos_in_step: usize,
-    voices: Vec<Voice>,
+    voices: Vec<Instance>,
     /// One string per kit slot, allocated up front. Slots backed by a sample or a wub simply
     /// never ring theirs.
     strings: Vec<Ks>,
+    /// Hits due this step, reused every step. It exists only so `trigger_step` can read the
+    /// song and then mutate self without allocating on the audio thread.
+    scratch: Vec<Hit>,
     pub master: f32,
     /// per-slot glow 0..1 for any display, decays per mix
     pub glow: [f32; 9],
 }
 
 impl Transport {
+    /// `kit` must have been loaded for `song.rate` -- `Kit::load(path, song.rate)`. The mixer
+    /// reads `kit.rate` as the authority, and the two being equal is what makes that safe.
     pub fn new(kit: Arc<Kit>, song: Song) -> Transport {
         let strings = (0..9).map(|_| Ks::new(kit.rate)).collect();
         Transport { kit, song, playing: false, global_step: 0, pos_in_step: 0,
-                    voices: Vec::with_capacity(32), strings, master: DEFAULT_MASTER, glow: [0.0; 9] }
+                    voices: Vec::with_capacity(32), strings, scratch: Vec::with_capacity(64),
+                    master: DEFAULT_MASTER, glow: [0.0; 9] }
     }
 
     pub fn apply(&mut self, c: Cmd) {
@@ -245,84 +272,83 @@ impl Transport {
     }
 
     fn start(&mut self, h: &Hit) {
-        let v = match self.kit.voices.get(h.slot).and_then(|v| v.as_ref()) { Some(v) => v, None => return };
+        // An Arc bump rather than a borrow of `self.kit`: it costs one atomic increment and
+        // no allocation, and it frees `self.strings` and `self.voices` to be touched below.
+        let kit = self.kit.clone();
+        let v = match kit.voices.get(h.slot).and_then(|v| v.as_ref()) { Some(v) => v, None => return };
         let m = &h.mods;
-        let sr = self.kit.rate as f32;
+        let sr = kit.rate as f32;
 
-        // A string is played, not replayed: it takes a note per hit and rings on in
-        // `self.strings[slot]` rather than being resynthesised as a one-shot Voice.
-        if let Some(p) = v.string.clone() {
-            // `pitch` is a ratio on top of the note rather than a replacement for it, so the
-            // TUNE knob still detunes a string the way it detunes a sample.
-            let f0 = crate::string::note_hz(m.note.unwrap_or(p.note) as f32)
-                * m.pitch.filter(|x| *x > 0.0).unwrap_or(1.0);
-            let damp = m.damp.unwrap_or(p.damp);
-            let sounding = self.voices.iter().any(|x| x.slot == h.slot && x.is_string);
-            let ks = &mut self.strings[h.slot];
-            match m.slide_ms.filter(|x| *x > 0.0) {
-                // A slide on a ringing string is the fretting hand moving: the delay line
-                // changes length and the string is never picked again. With nothing sounding
-                // there is nothing to slide from, so it is an ordinary note.
-                Some(ms) if sounding => { ks.glide_to(f0, ms); ks.set_damp(damp); }
-                _ => ks.pluck(f0, h.vel as f32 / 127.0, &p, damp),
+        // Common to every kind. (vel/127)^2: perceived loudness tracks power, linear
+        // velocity feels top-heavy.
+        let gain = (h.vel.clamp(1, 127) as f32 / 127.0).powi(2) * m.gain.unwrap_or(1.0);
+        let drive = m.drive.filter(|d| *d > 0.0);
+        let crush = m.crush.filter(|b| (1..16).contains(b)).map(|b| (1u32 << b) as f32);
+        let decay_k = m.decay_ms.filter(|d| *d > 0.0)
+            .map(|d| (-(1000.0f32.ln()) / (sr * d / 1000.0)).exp());
+
+        let play = match &v.source {
+            // A string is played, not replayed: it takes a note per hit and rings on in
+            // `self.strings[slot]` rather than being resynthesised as a one-shot.
+            Source::String(p) => {
+                // `pitch` is a ratio on top of the note rather than a replacement for it, so
+                // the TUNE knob still detunes a string the way it detunes a sample.
+                let f0 = crate::string::note_hz(m.note.unwrap_or(p.note) as f32)
+                    * m.pitch.filter(|x| *x > 0.0).unwrap_or(1.0);
+                let damp = m.damp.unwrap_or(p.damp);
+                let sounding = self.voices.iter()
+                    .any(|x| x.slot == h.slot && matches!(x.play, Playing::String));
+                let ks = &mut self.strings[h.slot];
+                match m.slide_ms.filter(|x| *x > 0.0) {
+                    // A slide on a ringing string is the fretting hand moving: the delay line
+                    // changes length and the string is never picked again. With nothing
+                    // sounding there is nothing to slide from, so it is an ordinary note.
+                    Some(ms) if sounding => { ks.glide_to(f0, ms); ks.set_damp(damp); }
+                    _ => ks.pluck(f0, h.vel as f32 / 127.0, p, damp),
+                }
+                // One neck: a second note on this slot takes the string over rather than
+                // stacking a second copy of it.
+                self.voices.retain(|x| x.slot != h.slot);
+                Playing::String
             }
-            // One neck: a second note on this slot takes the string over rather than
-            // stacking a second copy of it.
-            self.voices.retain(|x| x.slot != h.slot);
-            if self.voices.len() >= 32 { self.voices.remove(0); }
-            self.voices.push(Voice {
-                slot: h.slot,
-                wub: None,
-                is_string: true,
-                pos: 0.0,
-                step: 1.0,
-                rev: false,
-                gain: (h.vel.clamp(1, 127) as f32 / 127.0).powi(2) * m.gain.unwrap_or(1.0),
-                drive: m.drive.filter(|d| *d > 0.0),
-                crush: m.crush.filter(|b| (1..16).contains(b)).map(|b| (1u32 << b) as f32),
-                decay_k: m.decay_ms.filter(|d| *d > 0.0).map(|d| (-(1000.0f32.ln()) / (sr * d / 1000.0)).exp()),
-                env: 1.0,
-            });
-            self.glow[h.slot] = 1.0;
-            return;
-        }
+            // A wub is synthesised: per-hit drive/crush override the kit's, pitch moves the
+            // note, decay_ms the release, velocity the gain. The wobble follows the bpm.
+            Source::Wub(p) => {
+                let mut p = p.clone();
+                if m.drive.is_some() { p.drive = m.drive; }
+                if m.crush.is_some() { p.crush = m.crush; }
+                Playing::Wub(WubState::new(&p, kit.rate,
+                    m.pitch.filter(|p| *p > 0.0).unwrap_or(1.0), self.song.bpm, m.decay_ms))
+            }
+            // A sample and a kick are both just buffers by now.
+            Source::Sample { .. } | Source::Kick(_) => {
+                let rev = m.rev.unwrap_or(false);
+                let len = v.mono.len() as f32;
+                Playing::Buffer {
+                    pos: if rev { (len - 2.0).max(0.0) } else { 0.0 },
+                    step: m.pitch.filter(|p| *p > 0.0).unwrap_or(1.0),
+                    rev,
+                }
+            }
+        };
 
         if self.voices.len() >= 32 { self.voices.remove(0); }
-        let len = v.mono.len() as f32;
-        let rev = m.rev.unwrap_or(false);
-        // A wub is synthesised: per-hit drive/crush override the kit's, pitch moves the
-        // note, decay_ms the release, velocity the gain (below). The wobble follows the bpm.
-        let wub = v.wub.as_ref().map(|p| {
-            let mut p = p.clone();
-            if m.drive.is_some() { p.drive = m.drive; }
-            if m.crush.is_some() { p.crush = m.crush; }
-            WubState::new(&p, self.kit.rate, m.pitch.filter(|p| *p > 0.0).unwrap_or(1.0), self.song.bpm, m.decay_ms)
-        });
-        self.voices.push(Voice {
-            slot: h.slot,
-            wub,
-            is_string: false,
-            pos: if rev { (len - 2.0).max(0.0) } else { 0.0 },
-            step: m.pitch.filter(|p| *p > 0.0).unwrap_or(1.0),
-            rev,
-            // (vel/127)^2: perceived loudness tracks power, linear velocity feels top-heavy
-            gain: (h.vel.clamp(1, 127) as f32 / 127.0).powi(2) * m.gain.unwrap_or(1.0),
-            drive: m.drive.filter(|d| *d > 0.0),
-            crush: m.crush.filter(|b| (1..16).contains(b)).map(|b| (1u32 << b) as f32),
-            decay_k: m.decay_ms.filter(|d| *d > 0.0).map(|d| (-(1000.0f32.ln()) / (sr * d / 1000.0)).exp()),
-            env: 1.0,
-        });
+        self.voices.push(Instance { play, slot: h.slot, gain, drive, crush, decay_k, env: 1.0 });
         self.glow[h.slot] = 1.0;
     }
 
     fn trigger_step(&mut self) {
         let gs = self.global_step;
-        // collect first: triggering borrows self mutably
-        let hits: Vec<Hit> = self.song.tracks.iter()
-            .filter(|t| !t.mute && t.len > 0)
-            .flat_map(|t| t.cells[(gs % t.len as u64) as usize].iter().cloned())
-            .collect();
-        for h in &hits { self.start(h); }
+        // Collect first, because triggering borrows self mutably. `scratch` is swapped out
+        // and back rather than allocated: `take` leaves an empty Vec behind, which costs
+        // nothing, and the buffer itself is reused every step.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+        for t in self.song.tracks.iter().filter(|t| !t.mute && t.len > 0) {
+            scratch.extend_from_slice(&t.cells[(gs % t.len as u64) as usize]);
+        }
+        for h in &scratch { self.start(h); }
+        self.scratch = scratch;
     }
 
     /// Fill `out` with kit-rate mono, advancing the clock. Additive over zeroed buffer.
@@ -358,8 +384,8 @@ impl Transport {
     fn mix(&mut self, out: &mut [f32]) {
         let kit = &self.kit;
         let strings = &mut self.strings;
-        self.voices.retain_mut(|v| {
-            if v.is_string {
+        self.voices.retain_mut(|v| match &mut v.play {
+            Playing::String => {
                 let ks = match strings.get_mut(v.slot) { Some(k) => k, None => return false };
                 let norm = v.drive.map(|d| d.tanh());
                 for o in out.iter_mut() {
@@ -370,31 +396,35 @@ impl Transport {
                     *o += s;
                     if let Some(k) = v.decay_k { v.env *= k; if v.env < 0.001 { return false; } }
                 }
-                return !ks.done();
+                !ks.done()
             }
-            if let Some(st) = v.wub.as_mut() {
+            // A wub carries its own drive, crush and decay in its parameters, so the
+            // instance-level ones are deliberately NOT applied a second time here.
+            Playing::Wub(st) => {
                 for o in out.iter_mut() {
                     if st.done() { return false; }
                     *o += st.next() * v.gain;
                 }
-                return !st.done();
+                !st.done()
             }
-            let src = match kit.voices.get(v.slot).and_then(|s| s.as_ref()) { Some(s) => &s.mono, None => return false };
-            let last = src.len().saturating_sub(1);
-            if last == 0 { return false; }
-            let norm = v.drive.map(|d| d.tanh());
-            for o in out.iter_mut() {
-                let i = v.pos as usize;
-                if i >= last { return false; }
-                let f = v.pos - i as f32;
-                let mut s = (src[i] * (1.0 - f) + src[i + 1] * f) * v.gain * v.env;
-                if let Some(lv) = v.crush { s = (s * lv).round() / lv; }
-                if let (Some(d), Some(n)) = (v.drive, norm) { s = (s * d).tanh() / n; }
-                *o += s;
-                if v.rev { if v.pos < v.step { return false; } v.pos -= v.step; } else { v.pos += v.step; }
-                if let Some(k) = v.decay_k { v.env *= k; if v.env < 0.001 { return false; } }
+            Playing::Buffer { pos, step, rev } => {
+                let src = match kit.voices.get(v.slot).and_then(|s| s.as_ref()) { Some(s) => &s.mono, None => return false };
+                let last = src.len().saturating_sub(1);
+                if last == 0 { return false; }
+                let norm = v.drive.map(|d| d.tanh());
+                for o in out.iter_mut() {
+                    let i = *pos as usize;
+                    if i >= last { return false; }
+                    let f = *pos - i as f32;
+                    let mut s = (src[i] * (1.0 - f) + src[i + 1] * f) * v.gain * v.env;
+                    if let Some(lv) = v.crush { s = (s * lv).round() / lv; }
+                    if let (Some(d), Some(n)) = (v.drive, norm) { s = (s * d).tanh() / n; }
+                    *o += s;
+                    if *rev { if *pos < *step { return false; } *pos -= *step; } else { *pos += *step; }
+                    if let Some(k) = v.decay_k { v.env *= k; if v.env < 0.001 { return false; } }
+                }
+                true
             }
-            true
         });
     }
 
@@ -416,7 +446,7 @@ impl Transport {
         t.playing = false;
         // Long enough for the last hit to ring out: a second covers any drum or wub, but a
         // string is still sounding well past that, so give a kit with one the longer tail.
-        let strings = t.kit.voices.iter().flatten().any(|v| v.string.is_some());
+        let strings = t.kit.voices.iter().flatten().any(|v| matches!(v.source, Source::String(_)));
         let mut tail = vec![0.0f32; (t.kit.rate as f32 * if strings { 2.5 } else { 1.0 }) as usize];
         t.fill(&mut tail);
         out.extend_from_slice(&tail);
@@ -424,21 +454,34 @@ impl Transport {
     }
 }
 
-/// Kit-rate → device-rate shim with a fractional cursor carried across calls (no clicks at
-/// callback boundaries).
+/// Project-rate → device-rate shim with a fractional cursor carried across calls (no clicks
+/// at callback boundaries).
+///
+/// This is the FALLBACK, not the normal path: the project rate is meant to be the device's
+/// native rate, and then this is never constructed. It exists for the device that will not
+/// open at the project's rate.
 pub struct Resampler {
-    ratio: f32,      // kit_rate / dev_rate
-    buf: Vec<f32>,   // kit-rate samples not yet consumed
+    ratio: f32,      // project_rate / dev_rate
+    buf: Vec<f32>,   // project-rate samples not yet consumed
     pos: f32,
 }
 
+/// Capacity of `Resampler::buf`, committed at construction so `run` never reallocates on the
+/// audio thread. One callback needs `out.len() * ratio` samples; this covers a 8192-frame
+/// device buffer resampling up from any sane rate, which is far past anything WASAPI hands us.
+const RESAMPLER_CAP: usize = 16384;
+
 impl Resampler {
-    pub fn new(kit_rate: u32, dev_rate: u32) -> Resampler {
-        Resampler { ratio: kit_rate as f32 / dev_rate as f32, buf: Vec::with_capacity(4096), pos: 0.0 }
+    pub fn new(project_rate: u32, dev_rate: u32) -> Resampler {
+        Resampler { ratio: project_rate as f32 / dev_rate as f32,
+                    buf: Vec::with_capacity(RESAMPLER_CAP), pos: 0.0 }
     }
-    /// Produce `out.len()` device-rate samples, pulling kit-rate audio via `pull` as needed.
+    /// Produce `out.len()` device-rate samples, pulling project-rate audio via `pull` as needed.
     pub fn run<F: FnMut(&mut [f32])>(&mut self, out: &mut [f32], mut pull: F) {
         let need = (out.len() as f32 * self.ratio) as usize + 2;
+        debug_assert!((self.pos as usize) + need + 1024 <= RESAMPLER_CAP,
+                      "resampler buffer would grow past its committed capacity and allocate \
+                       on the audio thread: need {need}, cap {RESAMPLER_CAP}");
         while self.buf.len() < (self.pos as usize) + need {
             let start = self.buf.len();
             self.buf.resize(start + 1024, 0.0);
@@ -482,7 +525,8 @@ mod tests {
         s.tracks[0].len = 16;
         s.tracks.push(Track::new("b", 12));
         assert_eq!(s.cycle_steps(), 48);
-        let mut s = Song { bpm: 120.0, tracks: vec![Track::new("a", 7), Track::new("b", 5), Track::new("c", 3)] };
+        let mut s = Song { bpm: 120.0, rate: DEFAULT_RATE,
+                           tracks: vec![Track::new("a", 7), Track::new("b", 5), Track::new("c", 3)] };
         s.normalise();
         assert_eq!(s.cycle_steps(), 105);
     }
@@ -504,6 +548,54 @@ mod tests {
         assert_eq!(m.drive, Some(2.0));
         assert_eq!(m.crush, Some(8));
         assert_eq!(m.rev, None);
+    }
+
+    /// The point of Phase 0's allocation work. A Vec growing inside the callback is a lock
+    /// and maybe a syscall on a thread with a ~10 ms deadline; it never fails loudly, it
+    /// fails as a click under load on someone else's machine. All three source kinds are
+    /// sounding at once here, because each one takes a different path through `mix`.
+    #[test]
+    fn filling_the_audio_buffer_allocates_nothing() {
+        use crate::kit::{KickParams, Source, Voice as KitVoice};
+        use crate::wub::WubParams;
+
+        let voice = |source| Some(KitVoice {
+            label: "v".into(), color: [0, 0, 0], mono: vec![0.1; 4096], source,
+        });
+        let mut voices: [Option<KitVoice>; 9] = Default::default();
+        voices[0] = voice(Source::Kick(KickParams::default()));
+        voices[1] = voice(Source::Sample { path: "unused.wav".into() });
+        voices[2] = voice(Source::Wub(WubParams::default()));
+        voices[3] = voice(Source::String(crate::string::Params::default()));
+
+        let kit = Arc::new(Kit { name: "t".into(), rate: 48000, voices });
+        let mut song = Song::empty(120.0);
+        song.rate = 48000;
+        song.tracks[0].len = 4;
+        song.tracks[0].cells = (0..4).map(|s| vec![Hit { slot: s, vel: 100, mods: Mods::default() }]).collect();
+
+        let mut t = Transport::new(kit, song);
+        t.playing = true;
+        let mut buf = vec![0.0f32; 512];
+        // Warm up outside the guard: the scratch and voice vectors are allowed to reach
+        // their working size once. What must not happen is growth in the steady state.
+        for _ in 0..16 { t.fill(&mut buf); }
+
+        let before = crate::noalloc::violations();
+        crate::noalloc::forbidden(|| { for _ in 0..400 { t.fill(&mut buf); } });
+        assert_eq!(crate::noalloc::violations(), before,
+                   "Transport::fill allocated on the audio thread");
+    }
+
+    #[test]
+    fn a_song_without_a_rate_reads_as_the_default_and_one_with_it_is_kept() {
+        let s: Song = serde_json::from_str(r#"{"bpm":120.0,"tracks":[]}"#).unwrap();
+        assert_eq!(s.rate, DEFAULT_RATE);
+        let s: Song = serde_json::from_str(r#"{"bpm":120.0,"rate":44100,"tracks":[]}"#).unwrap();
+        assert_eq!(s.rate, 44100);
+        let mut s: Song = serde_json::from_str(r#"{"bpm":120.0,"rate":7,"tracks":[]}"#).unwrap();
+        s.normalise();
+        assert_eq!(s.rate, DEFAULT_RATE, "an absurd rate falls back rather than dividing by it");
     }
 
     #[test]

@@ -75,7 +75,10 @@ impl Out {
         let per_call = Arc::new(AtomicU32::new(0));
         let (counter, seen) = (frames.clone(), per_call.clone());
         let ch = channels as usize;
-        let mut mono: Vec<f32> = Vec::new();
+        // Sized once, here, off the audio thread. 8192 frames is far past any WASAPI
+        // shared-mode period, so the resize in the callback is a correctness net that never
+        // actually fires -- and if it ever did, the noalloc guard would say so.
+        let mut mono: Vec<f32> = vec![0.0; 8192];
 
         let stream = device.build_output_stream(
             config,
@@ -84,7 +87,7 @@ impl Out {
                 if mono.len() < n { mono.resize(n, 0.0); }
                 let m = &mut mono[..n];
                 for s in m.iter_mut() { *s = 0.0; }
-                fill(m);
+                crate::noalloc::forbidden(|| fill(m));
                 // Mono into every channel, with a hard clamp as the final safety net —
                 // a wrapped drum transient sounds like a gunshot. The musical soft clip
                 // happens upstream in the mixer.

@@ -4,6 +4,13 @@
 //!   voice <slot 0-8> <label> <r,g,b> <source> [mutations...]
 //! Paths are relative to the kit file's directory.
 //!
+//! A kit is loaded FOR a project rate (`Kit::load(path, rate)`) and every voice ends up
+//! rendered at it: synths generate there directly, and a sample recorded at another rate is
+//! resampled once, here, so the mixer never asks what rate a voice is in. A sample already
+//! at the project rate is passed through untouched — that exactness is what lets a 44.1 kHz
+//! project keep producing the bytes it always did. There is no "the first sample decides the
+//! kit's rate" rule any more, and a kit may freely mix sample rates.
+//!
 //! <source> is a WAV path, `synth:kick`, `synth:wub`, or `synth:string`. Mutations are
 //! trailing tokens, applied in the order listed below and BAKED into the voice at load —
 //! zero cost at play time (a wub or string is generated per hit instead; see wub.rs / below):
@@ -35,7 +42,7 @@
 
 use crate::string;
 use crate::wav::Wav;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use crate::wub::{self, WubParams};
 
 /// Parsed `key=value` / flag mutations from the end of a voice line.
@@ -143,21 +150,152 @@ fn mutate(mono: &mut Vec<f32>, m: &Muts) {
     if let Some(g) = m.gain { for s in mono.iter_mut() { *s *= g; } }
 }
 
-/// Generates a synth voice. Only `kick` exists so far.
-fn synth(kind: &str, rate: u32, m: &Muts) -> Result<Vec<f32>, String> {
-    match kind {
-        "kick" => Ok(synth_kick(rate,
-            m.f0.unwrap_or(50.0), m.sweep.unwrap_or(120.0),
-            m.decay.unwrap_or(400.0), m.click.unwrap_or(0.3))),
-        other => Err(format!("unknown synth '{other}' (have: kick)")),
+#[derive(Clone, Debug)]
+pub struct KickParams { pub f0: f32, pub sweep: f32, pub decay_ms: f32, pub click: f32 }
+
+impl Default for KickParams {
+    fn default() -> KickParams { KickParams { f0: 50.0, sweep: 120.0, decay_ms: 400.0, click: 0.3 } }
+}
+
+/// What a voice is made of. Every kind of voice goes through this one enum: adding a fifth
+/// means a variant, a `build` arm and a `render_baked` arm, and nothing else in the tree.
+///
+/// `build` owns the whole key table — the mapping from a kit line's mutation tokens to a
+/// voice's parameters lives here and only here. `render_baked` produces `Voice.mono` at the
+/// project rate: for a sample that IS the voice, and for a synth it is a preview for the
+/// mixers that read `mono` directly (bench `show`/`live`, bake's fallback WAV) while the
+/// Transport synthesises the real thing per hit.
+#[derive(Clone, Debug)]
+pub enum Source {
+    Sample { path: PathBuf },
+    Kick(KickParams),
+    Wub(WubParams),
+    String(string::Params),
+}
+
+impl Source {
+    /// `<source>` plus its peeled mutations → a Source. Kit-level pitch/drive/crush/gain fold
+    /// into a synth's own parameters here; for a sample they stay in `Muts` and are baked
+    /// into the buffer afterwards by `mutate` (see `takes_mutations`).
+    fn build(source: &str, m: &Muts) -> Result<Source, String> {
+        match source {
+            "synth:kick" => Ok(Source::Kick(KickParams {
+                f0: m_or(m.f0, 50.0), sweep: m_or(m.sweep, 120.0),
+                decay_ms: m_or(m.decay, 400.0), click: m_or(m.click, 0.3),
+            })),
+            "synth:wub" => {
+                let d = WubParams::default();
+                Ok(Source::Wub(WubParams {
+                    f0: m_or(m.f0, d.f0) * m_or(m.pitch, 1.0),
+                    wave: m.wave.unwrap_or(d.wave),
+                    detune_cents: m_or(m.detune, d.detune_cents),
+                    sub: m_or(m.sub, d.sub),
+                    cutoff: m_or(m.cutoff, d.cutoff),
+                    floor: m_or(m.floor, d.floor),
+                    res: m_or(m.res, d.res),
+                    wob: m_or(m.wob, d.wob),
+                    hold_ms: m_or(m.hold, d.hold_ms),
+                    decay_ms: m_or(m.decay, d.decay_ms),
+                    drive: if m.drive.is_some() { m.drive } else { d.drive },
+                    crush: m.crush,
+                    gain: m_or(m.gain, 1.0),
+                }))
+            }
+            "synth:string" => {
+                let d = string::Params::default();
+                Ok(Source::String(string::Params {
+                    note: m.note.unwrap_or(d.note),
+                    pick: m.pick.unwrap_or(d.pick),
+                    tone: m.tone.unwrap_or(d.tone),
+                    damp: m.damp.unwrap_or(d.damp),
+                    decay_ms: m.decay.unwrap_or(d.decay_ms),
+                    lp_hz: m.lp.unwrap_or(d.lp_hz),
+                }))
+            }
+            s => match s.strip_prefix("synth:") {
+                Some(other) => Err(format!("unknown synth '{other}' (have: kick, wub, string)")),
+                None => Ok(Source::Sample { path: PathBuf::from(s) }),
+            },
+        }
     }
+
+    /// The baked buffer at `rate`. A sample is read from disk and resampled to the project
+    /// rate if it was recorded at another one; a synth generates at `rate` directly, so there
+    /// is nothing to resample.
+    fn render_baked(&self, rate: u32, dir: &Path) -> Result<Vec<f32>, String> {
+        Ok(match self {
+            Source::Sample { path } => {
+                let p = dir.join(path);
+                let bytes = std::fs::read(&p).map_err(|e| format!("{}: {e}", path.display()))?;
+                let w = Wav::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+                resample(&w.mono(), w.rate, rate)
+            }
+            Source::Kick(p) => synth_kick(rate, p),
+            Source::Wub(p) => wub::preview(p, rate),
+            Source::String(p) => string_preview(p, rate),
+        })
+    }
+
+    /// True when kit-level pitch/rev/crush/drive/gain are baked into the buffer rather than
+    /// folded into the voice's own parameters by `build`.
+    fn takes_mutations(&self) -> bool {
+        matches!(self, Source::Sample { .. } | Source::Kick(_))
+    }
+}
+
+/// Windowed-sinc resample of `src` from `from` Hz to `to` Hz. Identical rates return the
+/// input untouched — that exactness is what keeps a 44.1 kHz project bit-for-bit identical
+/// to what the kit rendered before the project rate existed.
+///
+/// The kernel is a Blackman-windowed sinc, 32 zero crossings wide, with the cutoff pulled
+/// down to the lower of the two Nyquists so downsampling filters rather than aliases.
+pub fn resample(src: &[f32], from: u32, to: u32) -> Vec<f32> {
+    if from == to || src.is_empty() { return src.to_vec(); }
+    let ratio = to as f64 / from as f64;
+    let cutoff = if ratio < 1.0 { ratio } else { 1.0 };
+    const ZC: i64 = 32;
+    // Kernel half-width in SOURCE samples: a lowered cutoff stretches the sinc, so the
+    // window has to grow with it or the filter is truncated where it still has energy.
+    let half = (ZC as f64 / cutoff).ceil() as i64;
+    let n_out = ((src.len() as f64) * ratio).round() as usize;
+    let last = src.len() as i64 - 1;
+    (0..n_out).map(|i| {
+        let center = i as f64 / ratio;
+        let base = center.floor() as i64;
+        let mut acc = 0.0f64;
+        let mut norm = 0.0f64;
+        for k in (base - half + 1)..=(base + half) {
+            let x = center - k as f64;
+            let w = {
+                // Blackman over the kernel's own width, zero at the ends.
+                let t = (x / half as f64 + 1.0) * 0.5;
+                if !(0.0..=1.0).contains(&t) { 0.0 }
+                else {
+                    let tau = std::f64::consts::TAU;
+                    0.42 - 0.5 * (tau * t).cos() + 0.08 * (2.0 * tau * t).cos()
+                }
+            };
+            if w == 0.0 { continue; }
+            let s = {
+                let px = std::f64::consts::PI * x * cutoff;
+                if px.abs() < 1e-12 { cutoff } else { cutoff * px.sin() / px }
+            };
+            let tap = s * w;
+            // Clamp-extend the edges rather than zero-padding: zeros would fade the first
+            // and last few samples of a one-shot, which is exactly where a drum transient is.
+            acc += tap * src[k.clamp(0, last) as usize] as f64;
+            norm += tap;
+        }
+        (if norm.abs() > 1e-12 { acc / norm } else { 0.0 }) as f32
+    }).collect()
 }
 
 /// The 808 in one function: a sine whose frequency falls exponentially from `sweep` to
 /// `f0` over the first ~60 ms and whose amplitude decays exponentially to -60 dB at
 /// `decay` ms, with a few milliseconds of noise on the front for the beater. Drive it
 /// with the `drive=` mutation for the Prodigy wall; this is deliberately clean on its own.
-fn synth_kick(rate: u32, f0: f32, sweep: f32, decay_ms: f32, click: f32) -> Vec<f32> {
+fn synth_kick(rate: u32, p: &KickParams) -> Vec<f32> {
+    let KickParams { f0, sweep, decay_ms, click } = *p;
     let sr = rate as f32;
     let n = (sr * decay_ms / 1000.0 * 1.2) as usize;
     let amp_k = -(1000.0f32.ln()) / (sr * decay_ms / 1000.0);   // -60 dB at decay_ms
@@ -181,28 +319,29 @@ fn synth_kick(rate: u32, f0: f32, sweep: f32, decay_ms: f32, click: f32) -> Vec<
 pub struct Voice {
     pub label: String,
     pub color: [u8; 3],
-    /// the sample (for a wub: a preview render, used only by the sample-only mixers)
+    /// The baked buffer at the kit's rate. For a sample this IS the voice; for a synth it is
+    /// a fixed preview for the mixers that read `mono` directly, since the Transport
+    /// synthesises those per hit from `source` instead.
     pub mono: Vec<f32>,
-    /// Some for a synth:wub voice: the Transport synthesises it per hit instead of reading `mono`
-    pub wub: Option<WubParams>,
-    /// Some for a synth:string voice (a plucked string, see string.rs): the Transport rings
-    /// its own `Ks` per hit instead of reading `mono`, which here is only a fixed-note
-    /// preview for the sample-only mixers (bench `show`/`live`, bake's fallback WAV).
-    pub string: Option<string::Params>,
+    pub source: Source,
 }
 
 #[derive(Debug)]
 pub struct Kit {
     pub name: String,
+    /// The rate everything in this kit was rendered at — the project rate it was loaded for,
+    /// never "whatever the first sample happened to be".
     pub rate: u32,
     pub voices: [Option<Voice>; 9],
 }
 
 impl Kit {
-    pub fn load(path: &Path) -> Result<Kit, String> {
+    /// Loads a kit FOR a project rate. Every voice — sample or synth — ends up rendered at
+    /// `rate`, so the mixer never has to ask what rate a given voice is in.
+    pub fn load(path: &Path, rate: u32) -> Result<Kit, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let dir = path.parent().unwrap_or(Path::new("."));
-        let mut kit = Kit { name: "untitled".into(), rate: 0, voices: Default::default() };
+        let mut kit = Kit { name: "untitled".into(), rate, voices: Default::default() };
         for (ln, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') { continue; }
@@ -231,70 +370,16 @@ impl Kit {
                     let (source, muts) = split_mutations(s.trim());
                     if source.is_empty() { return Err(format!("line {}: missing source", ln + 1)); }
 
-                    // A wub is not a sample: keep its parameters and synthesise per hit.
-                    // Kit-level pitch/drive/crush/gain fold into the parameters; `mono`
-                    // gets a preview render for the mixers that only read samples.
-                    if source == "synth:wub" {
-                        if kit.rate == 0 { kit.rate = 44100; }
-                        let d = WubParams::default();
-                        let p = WubParams {
-                            f0: m_or(muts.f0, d.f0) * m_or(muts.pitch, 1.0),
-                            wave: muts.wave.unwrap_or(d.wave),
-                            detune_cents: m_or(muts.detune, d.detune_cents),
-                            sub: m_or(muts.sub, d.sub),
-                            cutoff: m_or(muts.cutoff, d.cutoff),
-                            floor: m_or(muts.floor, d.floor),
-                            res: m_or(muts.res, d.res),
-                            wob: m_or(muts.wob, d.wob),
-                            hold_ms: m_or(muts.hold, d.hold_ms),
-                            decay_ms: m_or(muts.decay, d.decay_ms),
-                            drive: if muts.drive.is_some() { muts.drive } else { d.drive },
-                            crush: muts.crush,
-                            gain: m_or(muts.gain, 1.0),
-                        };
-                        let mono = wub::preview(&p, kit.rate);
-                        kit.voices[slot] = Some(Voice { label, color, mono, wub: Some(p), string: None });
-                        continue;
-                    }
-
-                    // A string is likewise not a sample: it takes a note per hit, so it
-                    // needs its own live Ks in the Transport. `mono` here is a fixed-note
-                    // preview for the sample-only mixers, at the voice's own default note.
-                    if source == "synth:string" {
-                        if kit.rate == 0 { kit.rate = 44100; }
-                        let d = string::Params::default();
-                        let p = string::Params {
-                            note: muts.note.unwrap_or(d.note),
-                            pick: muts.pick.unwrap_or(d.pick),
-                            tone: muts.tone.unwrap_or(d.tone),
-                            damp: muts.damp.unwrap_or(d.damp),
-                            decay_ms: muts.decay.unwrap_or(d.decay_ms),
-                            lp_hz: muts.lp.unwrap_or(d.lp_hz),
-                        };
-                        let mono = string_preview(&p, kit.rate);
-                        kit.voices[slot] = Some(Voice { label, color, mono, wub: None, string: Some(p) });
-                        continue;
-                    }
-                    let mut mono = if let Some(kind) = source.strip_prefix("synth:") {
-                        // A synth voice may precede any sample; it needs a rate before one
-                        // has been seen, so default to CD rate and let a later sample
-                        // disagree loudly rather than silently resample.
-                        if kit.rate == 0 { kit.rate = 44100; }
-                        synth(kind, kit.rate, &muts).map_err(|e| format!("line {}: {e}", ln + 1))?
-                    } else {
-                        let bytes = std::fs::read(dir.join(source)).map_err(|e| format!("{source}: {e}"))?;
-                        let w = Wav::parse(&bytes).map_err(|e| format!("{source}: {e}"))?;
-                        if kit.rate == 0 { kit.rate = w.rate; }
-                        else if w.rate != kit.rate { return Err(format!("{source}: rate {} != kit rate {}", w.rate, kit.rate)); }
-                        w.mono()
-                    };
-                    mutate(&mut mono, &muts);
-                    kit.voices[slot] = Some(Voice { label, color, mono, wub: None, string: None });
+                    let source = Source::build(source, &muts).map_err(|e| format!("line {}: {e}", ln + 1))?;
+                    let mut mono = source.render_baked(kit.rate, dir)
+                        .map_err(|e| format!("line {}: {e}", ln + 1))?;
+                    if source.takes_mutations() { mutate(&mut mono, &muts); }
+                    kit.voices[slot] = Some(Voice { label, color, mono, source });
                 }
                 _ => return Err(format!("line {}: unknown key {key}", ln + 1)),
             }
         }
-        if kit.rate == 0 { return Err("kit has no voices".into()); }
+        if kit.voices.iter().all(|v| v.is_none()) { return Err("kit has no voices".into()); }
         Ok(kit)
     }
 }
@@ -308,6 +393,81 @@ fn string_preview(p: &string::Params, rate: u32) -> Vec<f32> {
     ks.pluck(string::note_hz(p.note as f32), 1.0, p, p.damp);
     let n = (rate as f32 * p.decay_ms / 1000.0 * 1.2) as usize;
     (0..n).map(|_| ks.next()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole bit-exactness guarantee rests on this: a project at the rate its samples
+    /// are already in must not be filtered, dithered or interpolated on the way in.
+    #[test]
+    fn resampling_to_the_same_rate_is_the_identity() {
+        let src: Vec<f32> = (0..1000).map(|i| (i as f32 * 0.037).sin()).collect();
+        let out = resample(&src, 44100, 44100);
+        assert_eq!(out, src, "equal rates must return the input untouched, bit for bit");
+    }
+
+    #[test]
+    fn resampling_changes_length_by_the_rate_ratio() {
+        let src = vec![0.0f32; 4410];
+        assert_eq!(resample(&src, 44100, 48000).len(), 4800);
+        assert_eq!(resample(&src, 44100, 22050).len(), 2205);
+        assert!(resample(&[], 44100, 48000).is_empty());
+    }
+
+    /// A sine well below both Nyquists must survive a rate change with its shape intact --
+    /// the test that catches a kernel that is windowed wrongly or normalised wrongly.
+    #[test]
+    fn a_sine_survives_a_rate_change() {
+        const HZ: f32 = 440.0;
+        let src: Vec<f32> = (0..44100)
+            .map(|i| (std::f32::consts::TAU * HZ * i as f32 / 44100.0).sin()).collect();
+        let out = resample(&src, 44100, 48000);
+        // Compare against the sine the target rate should have produced, away from the
+        // edges where the kernel's clamp-extension legitimately differs.
+        let err = (2000..46000).map(|i| {
+            let want = (std::f32::consts::TAU * HZ * i as f32 / 48000.0).sin();
+            (out[i] - want).abs()
+        }).fold(0f32, f32::max);
+        assert!(err < 0.01, "resampled sine drifted from the ideal by {err}");
+    }
+
+    /// Downsampling has to filter before it decimates. A tone above the target's Nyquist
+    /// must come back quiet rather than folding down as a phantom low note.
+    #[test]
+    fn downsampling_filters_instead_of_aliasing() {
+        // 15 kHz into a 22.05 kHz project: Nyquist is 11.025 kHz, so this must be rejected.
+        let src: Vec<f32> = (0..44100)
+            .map(|i| (std::f32::consts::TAU * 15000.0 * i as f32 / 44100.0).sin()).collect();
+        let out = resample(&src, 44100, 22050);
+        let peak = out[500..out.len() - 500].iter().fold(0f32, |m, s| m.max(s.abs()));
+        assert!(peak < 0.1, "a tone above the target Nyquist aliased through at {peak}");
+    }
+
+    #[test]
+    fn the_source_builder_owns_the_key_table() {
+        let (src, m) = split_mutations("synth:kick f0=44 decay=420");
+        assert_eq!(src, "synth:kick");
+        match Source::build(src, &m).unwrap() {
+            Source::Kick(k) => { assert_eq!(k.f0, 44.0); assert_eq!(k.decay_ms, 420.0); }
+            other => panic!("expected a kick, got {other:?}"),
+        }
+        let (src, m) = split_mutations("drums/snare.wav pitch=0.85 drive=4");
+        assert!(matches!(Source::build(src, &m).unwrap(), Source::Sample { .. }));
+        assert_eq!(m.pitch, Some(0.85));
+        assert!(Source::build("synth:nope", &Muts::default()).is_err());
+    }
+
+    /// A sample bakes its kit-level mutations into the buffer; a synth folds them into its
+    /// own parameters instead, so applying them again afterwards would double them.
+    #[test]
+    fn only_buffer_sources_take_baked_mutations() {
+        assert!(Source::Sample { path: "x.wav".into() }.takes_mutations());
+        assert!(Source::Kick(KickParams::default()).takes_mutations());
+        assert!(!Source::Wub(WubParams::default()).takes_mutations());
+        assert!(!Source::String(string::Params::default()).takes_mutations());
+    }
 }
 
 fn parse_rgb(s: &str) -> Result<[u8; 3], String> {

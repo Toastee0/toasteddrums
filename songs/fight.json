@@ -1,5 +1,6 @@
 {
   "bpm": 128.0,
+  "rate": 44100,
   "tracks": [
     {
       "name": "core", "len": 16, "intensity": 0,
