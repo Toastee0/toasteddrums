@@ -1,9 +1,0 @@
-{
-  "additionalFiles": "",
-  "compiler.optimization_flags": "-Os",
-  "customBuildProperties": "",
-  "fqbn": "esp32:esp32:XIAO_ESP32S3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi",
-  "hardwareFolders": "/srv/saltee-dev/arduino-data/packages/esp32/hardware/esp32/3.3.11,/srv/saltee-dev/arduino-data/packages/esp32/hardware/esp32/3.3.11",
-  "otherLibrariesFolders": "/srv/saltee-dev/arduino-user/libraries",
-  "sketchLocation": "/home/toastee/ToastedDrums/fw/pads"
-}
